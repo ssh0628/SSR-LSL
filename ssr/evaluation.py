@@ -22,6 +22,7 @@ class EpochSupervision:
 
     selection: SelectionResult
     structural_targets: Tensor | None
+    predictions: Tensor
 
 
 @torch.no_grad()
@@ -77,7 +78,19 @@ def evaluate_epoch(
             chunks=config.structural_labels.knn_chunks,
             num_classes=10,
         )
-    return EpochSupervision(selection, structural_targets)
+    predictions = probabilities.argmax(dim=1)
+    return EpochSupervision(selection, structural_targets, predictions)
+
+
+@torch.no_grad()
+def predict_training_labels(
+    loader: DataLoader,
+    networks: SSRNetworks,
+    device: torch.device,
+) -> Tensor:
+    """Return raw model predictions in the evaluation dataset's fixed order."""
+    _, probabilities = _extract_features_and_predictions(loader, networks, device)
+    return probabilities.argmax(dim=1)
 
 
 def selection_metrics(

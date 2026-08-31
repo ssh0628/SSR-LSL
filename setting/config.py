@@ -10,8 +10,6 @@ from typing import Literal
 
 import torch
 
-
-
 # PROJECT_ROOT = Path("/workspace/SSR-LSL").expanduser().resolve()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,12 +46,30 @@ class DataConfig:
         )
         return self.root / "noise" / filename
 
+    def validate(self) -> None:
+        if not self.root.is_absolute():
+            raise ValueError("data.root must be an absolute path.")
+        if self.noise_kind not in {"symmetric", "asymmetric", "idn"}:
+            raise ValueError("data.noise_kind must be symmetric, asymmetric, or idn.")
+        if not 0.0 <= self.noise_rate < 1.0:
+            raise ValueError("data.noise_rate must be in [0, 1).")
+        if self.idn_flip_rate_std <= 0.0:
+            raise ValueError("data.idn_flip_rate_std must be positive.")
+
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     """분류 backbone 설정."""
 
     name: ModelName = "preact_resnet18"  # 논문 backbone 또는 RLNLC의 CIFAR ResNet-18/34.
+
+    def validate(self) -> None:
+        if self.name not in {
+            "preact_resnet18",
+            "cifar_resnet18",
+            "cifar_resnet34",
+        }:
+            raise ValueError("Unsupported model.name.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +86,20 @@ class SSRConfig:
     feature_consistency_weight: float = 1.0  # feature-consistency loss 가중치 lambda_fc.
     mixup_alpha: float = 4.0  # CIFAR 실험의 Beta(alpha, alpha) mixup 파라미터.
 
+    def validate(self) -> None:
+        if not 0.0 <= self.relabel_threshold <= 1.0:
+            raise ValueError("ssr.relabel_threshold must be in [0, 1].")
+        if not 0.0 <= self.selection_threshold <= 1.0:
+            raise ValueError("ssr.selection_threshold must be in [0, 1].")
+        if not 1 <= self.neighbors <= 50_000:
+            raise ValueError("ssr.neighbors must be in [1, 50000].")
+        if self.knn_chunks < 1:
+            raise ValueError("ssr.knn_chunks must be positive.")
+        if self.feature_consistency_weight < 0.0:
+            raise ValueError("ssr.feature_consistency_weight must not be negative.")
+        if self.mixup_alpha <= 0.0:
+            raise ValueError("ssr.mixup_alpha must be positive.")
+
 
 @dataclass(frozen=True, slots=True)
 class StructuralLabelsConfig:
@@ -80,6 +110,45 @@ class StructuralLabelsConfig:
     # 결과에 영향 없이 reverse k-NN query를 나누는 메모리 chunk 수.
     knn_chunks: int = 10
     loss_weight: float = 1.0  # structural-label mixup cross-entropy 가중치 lambda_st.
+
+    def validate(self) -> None:
+        if not 1 <= self.neighbors <= 50_000:
+            raise ValueError("structural_labels.neighbors must be in [1, 50000].")
+        if self.knn_chunks < 1:
+            raise ValueError("structural_labels.knn_chunks must be positive.")
+        if self.loss_weight < 0.0:
+            raise ValueError("structural_labels.loss_weight must not be negative.")
+        if self.enabled and self.loss_weight == 0.0:
+            raise ValueError(
+                "Disable structural_labels for the SSR ablation instead of using zero loss weight."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class LabelWaveConfig:
+    """ICLR 2024 Label Wave checkpoint 선택 설정."""
+
+    enabled: bool = True  # True면 training prediction change를 추적하고 label_wave.pt 저장.
+    # False면 전체 epoch를 유지하며 선택 지점만 관찰; 검증 후 True로 바꿔 실제 조기 종료.
+    stop_training: bool = False
+    # 최근 k개 prediction-change의 이동평균. 논문 Appendix E에서 k=3 상관이 가장 강함.
+    moving_average_window: int = 3
+    # 논문은 patience 동작만 정의하고 고정 기본값은 공개하지 않아 실험값으로 노출.
+    patience: int = 10
+
+    def validate(self, training_epochs: int) -> None:
+        if self.moving_average_window < 1:
+            raise ValueError("label_wave.moving_average_window must be positive.")
+        if self.patience < 1:
+            raise ValueError("label_wave.patience must be positive.")
+        if self.stop_training and not self.enabled:
+            raise ValueError(
+                "Enable label_wave before setting label_wave.stop_training=True."
+            )
+        if self.enabled and self.moving_average_window > training_epochs:
+            raise ValueError(
+                "label_wave.moving_average_window must not exceed training.epochs."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +167,20 @@ class TrainingConfig:
     # epoch 사이 worker를 유지해 재시작 비용을 줄일지 여부.
     persistent_workers: bool = True
 
+    def validate(self) -> None:
+        if self.epochs < 1 or self.batch_size < 1:
+            raise ValueError("training epochs and batch_size must be positive.")
+        if self.learning_rate <= 0.0:
+            raise ValueError("training.learning_rate must be positive.")
+        if self.momentum < 0.0 or self.weight_decay < 0.0:
+            raise ValueError("training momentum and weight_decay must not be negative.")
+        if self.scheduler_eta_min_ratio < 0.0:
+            raise ValueError("training.scheduler_eta_min_ratio must not be negative.")
+        if self.num_workers < 0:
+            raise ValueError("training.num_workers must not be negative.")
+        if self.prefetch_factor < 1:
+            raise ValueError("training.prefetch_factor must be positive.")
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
@@ -106,6 +189,10 @@ class RuntimeConfig:
     device: str = "auto"  # "auto", "cuda", "mps", "cpu" 또는 torch device 문자열.
     # config, metric, checkpoint를 저장할 루트.
     output_root: Path = field(default_factory=lambda: PROJECT_ROOT / "outputs")
+
+    def validate(self) -> None:
+        if not self.output_root.is_absolute():
+            raise ValueError("runtime.output_root must be an absolute path.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +206,9 @@ class ExperimentConfig:
     structural_labels: StructuralLabelsConfig = field(
         default_factory=StructuralLabelsConfig
     )  # LSL reverse k-NN 및 structural loss 토글·설정.
+    label_wave: LabelWaveConfig = field(
+        default_factory=LabelWaveConfig
+    )  # validation GT 없는 checkpoint 선택 및 optional early stopping.
     training: TrainingConfig = field(default_factory=TrainingConfig)  # optimizer와 epoch 설정.
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -131,6 +221,12 @@ class ExperimentConfig:
             if self.structural_labels.enabled
             else "ssr"
         )
+        if self.label_wave.enabled:
+            mode = "stop" if self.label_wave.stop_training else "monitor"
+            algorithm += (
+                f"-lw-{mode}-k{self.label_wave.moving_average_window}"
+                f"-p{self.label_wave.patience}"
+            )
         signature = asdict(self)
         signature["runtime"].pop("output_root")
         encoded = json.dumps(
@@ -155,54 +251,13 @@ class ExperimentConfig:
         """학습을 시작하기 전에 잘못된 조합을 빠르게 차단."""
         if self.seed < 0:
             raise ValueError("seed must not be negative.")
-        if not self.data.root.is_absolute() or not self.runtime.output_root.is_absolute():
-            raise ValueError("data.root and runtime.output_root must be absolute paths.")
-        if self.data.noise_kind not in {"symmetric", "asymmetric", "idn"}:
-            raise ValueError("data.noise_kind must be symmetric, asymmetric, or idn.")
-        if not 0.0 <= self.data.noise_rate < 1.0:
-            raise ValueError("data.noise_rate must be in [0, 1).")
-        if self.data.idn_flip_rate_std <= 0.0:
-            raise ValueError("data.idn_flip_rate_std must be positive.")
-        if self.model.name not in {
-            "preact_resnet18",
-            "cifar_resnet18",
-            "cifar_resnet34",
-        }:
-            raise ValueError("Unsupported model.name.")
-        if not 0.0 <= self.ssr.relabel_threshold <= 1.0:
-            raise ValueError("ssr.relabel_threshold must be in [0, 1].")
-        if not 0.0 <= self.ssr.selection_threshold <= 1.0:
-            raise ValueError("ssr.selection_threshold must be in [0, 1].")
-        if not 1 <= self.ssr.neighbors <= 50_000:
-            raise ValueError("ssr.neighbors must be in [1, 50000].")
-        if self.ssr.knn_chunks < 1:
-            raise ValueError("ssr.knn_chunks must be positive.")
-        if self.ssr.feature_consistency_weight < 0.0:
-            raise ValueError("ssr.feature_consistency_weight must not be negative.")
-        if self.ssr.mixup_alpha <= 0.0:
-            raise ValueError("ssr.mixup_alpha must be positive.")
-        if not 1 <= self.structural_labels.neighbors <= 50_000:
-            raise ValueError("structural_labels.neighbors must be in [1, 50000].")
-        if self.structural_labels.knn_chunks < 1:
-            raise ValueError("structural_labels.knn_chunks must be positive.")
-        if self.structural_labels.loss_weight < 0.0:
-            raise ValueError("structural_labels.loss_weight must not be negative.")
-        if self.structural_labels.enabled and self.structural_labels.loss_weight == 0.0:
-            raise ValueError(
-                "Disable structural_labels for the SSR ablation instead of using zero loss weight."
-            )
-        if self.training.epochs < 1 or self.training.batch_size < 1:
-            raise ValueError("training epochs and batch_size must be positive.")
-        if self.training.learning_rate <= 0.0:
-            raise ValueError("training.learning_rate must be positive.")
-        if self.training.momentum < 0.0 or self.training.weight_decay < 0.0:
-            raise ValueError("training momentum and weight_decay must not be negative.")
-        if self.training.scheduler_eta_min_ratio < 0.0:
-            raise ValueError("training.scheduler_eta_min_ratio must not be negative.")
-        if self.training.num_workers < 0:
-            raise ValueError("training.num_workers must not be negative.")
-        if self.training.prefetch_factor < 1:
-            raise ValueError("training.prefetch_factor must be positive.")
+        self.data.validate()
+        self.model.validate()
+        self.ssr.validate()
+        self.structural_labels.validate()
+        self.training.validate()
+        self.label_wave.validate(self.training.epochs)
+        self.runtime.validate()
 
     def resolve_device(self) -> torch.device:
         """명시적 device를 존중하고 auto에서는 CUDA, MPS, CPU 순으로 선택."""

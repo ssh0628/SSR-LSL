@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -12,11 +13,13 @@ from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset
 
-from log.common import JsonlWriter, atomic_torch_save, write_config
+from label_wave import LabelWaveRun
+from log.checkpoint import CheckpointManager
+from log.common import JsonlWriter, write_config
 from setting.config import ExperimentConfig
 from setting.data import CIFAR10Data, build_cifar10_data
 from setting.model import SSRNetworks, build_ssr_networks
-from ssr.evaluation import evaluate_epoch, selection_metrics
+from ssr.evaluation import evaluate_epoch, predict_training_labels, selection_metrics
 from ssr.sampler import ClassBalancedSampler
 from ssr.selection import SelectionResult
 from ssr.trainer import test_accuracy, train_epoch
@@ -100,24 +103,6 @@ def _build_selected_loader(
     return loader
 
 
-def _checkpoint_state(
-    epoch: int,
-    networks: SSRNetworks,
-    optimizer: SGD,
-    config: ExperimentConfig,
-) -> dict[str, Any]:
-    return {
-        "cur_epoch": epoch,
-        "model_name": config.model.name,
-        "structural_labels_enabled": config.structural_labels.enabled,
-        "classifier": networks.classifier.state_dict(),
-        "encoder": networks.encoder.state_dict(),
-        "proj_head": networks.projector.state_dict(),
-        "pred_head": networks.predictor.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }
-
-
 def _build_optimizer(
     networks: SSRNetworks,
     config: ExperimentConfig,
@@ -153,6 +138,7 @@ def run(config: ExperimentConfig) -> float:
     clean_labels = data.clean_labels.to(device)
     networks = build_ssr_networks(config.model, device)
     optimizer = _build_optimizer(networks, config)
+    checkpoints = CheckpointManager(config.run_dir, networks, optimizer, config)
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=config.training.epochs,
@@ -168,7 +154,21 @@ def run(config: ExperimentConfig) -> float:
         f"actual_noise_rate={actual_noise_rate:.4f}"
     )
     best_accuracy = 0.0
-    with JsonlWriter(config.run_dir / "metrics.jsonl") as metrics_writer:
+    last_accuracy: float | None = None
+    last_completed_epoch = -1
+    stopped_by_label_wave = False
+    label_wave = (
+        LabelWaveRun(config.label_wave, config.run_dir, checkpoints)
+        if config.label_wave.enabled
+        else None
+    )
+
+    with ExitStack() as stack:
+        metrics_writer = stack.enter_context(
+            JsonlWriter(config.run_dir / "metrics.jsonl")
+        )
+        if label_wave is not None:
+            stack.enter_context(label_wave)
         for epoch in range(config.training.epochs):
             supervision = evaluate_epoch(
                 loaders.evaluation,
@@ -177,6 +177,16 @@ def run(config: ExperimentConfig) -> float:
                 config,
                 device,
             )
+            if label_wave is not None:
+                observation = label_wave.observe(
+                    supervision.predictions,
+                    completed_epochs=epoch,
+                    test_accuracy=last_accuracy,
+                )
+                if observation.should_stop and config.label_wave.stop_training:
+                    stopped_by_label_wave = True
+                    break
+
             selected_loader = _build_selected_loader(
                 data,
                 supervision.selection,
@@ -197,6 +207,8 @@ def run(config: ExperimentConfig) -> float:
             )
             current_accuracy = test_accuracy(loaders.test, networks, device)
             scheduler.step()
+            last_accuracy = current_accuracy
+            last_completed_epoch = epoch
 
             is_best = current_accuracy > best_accuracy
             if is_best:
@@ -221,13 +233,23 @@ def run(config: ExperimentConfig) -> float:
             )
 
             if is_best:
-                atomic_torch_save(
-                    _checkpoint_state(epoch, networks, optimizer, config),
-                    config.run_dir / "best.pt",
-                )
+                checkpoints.save("best.pt", epoch)
 
-    atomic_torch_save(
-        _checkpoint_state(config.training.epochs - 1, networks, optimizer, config),
-        config.run_dir / "last.pt",
+        if label_wave is not None and not stopped_by_label_wave:
+            final_predictions = predict_training_labels(
+                loaders.evaluation,
+                networks,
+                device,
+            )
+            label_wave.observe(
+                final_predictions,
+                completed_epochs=last_completed_epoch + 1,
+                test_accuracy=last_accuracy,
+            )
+
+    checkpoints.save(
+        "last.pt",
+        last_completed_epoch,
+        test_accuracy=last_accuracy,
     )
     return best_accuracy

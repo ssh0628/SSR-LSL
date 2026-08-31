@@ -86,7 +86,7 @@ def train_epoch(
 
         # p_weak는 loss에 직접 쓰이지 않지만
         # 공식 SSR의 predictor BN 갱신에 필요하다.
-        _weak_prediction = networks.predictor(weak_projection)
+        networks.predictor(weak_projection)
         strong_prediction = networks.predictor(strong_projection)
         consistency_loss = negative_cosine_similarity(
             strong_prediction,
