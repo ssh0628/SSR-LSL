@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -19,16 +18,12 @@ def hard_knn_scores(
     """Uniformly vote over the cosine-nearest labels, including self matches."""
     similarity = torch.mm(queries, feature_bank_transposed)
     similarity_weights, neighbor_indices = similarity.topk(k=neighbors, dim=-1)
-    neighbor_labels = torch.gather(
-        feature_labels.expand(queries.size(0), -1),
-        dim=-1,
-        index=neighbor_indices,
-    )
+    neighbor_labels = feature_labels[neighbor_indices]
 
     # This replacement is intentional: the official function is named
     # weighted_knn, but SSR's CIFAR implementation performs hard voting.
     similarity_weights = torch.ones_like(similarity_weights)
-    similarity_weights = similarity_weights / similarity_weights.sum(dim=-1, keepdim=True)
+    similarity_weights /= similarity_weights.sum(dim=-1, keepdim=True)
     one_hot = torch.zeros(
         queries.size(0) * neighbors,
         num_classes,
@@ -59,27 +54,28 @@ def balanced_knn_scores(
         raise ValueError("query and feature-bank dimensions must match.")
     if labels.numel() != feature_bank.size(0):
         raise ValueError("labels must contain one entry per feature-bank row.")
-    if neighbors > feature_bank.size(0):
-        raise ValueError("neighbors must not exceed the feature-bank size.")
+    if labels.ndim != 1:
+        raise ValueError("labels must be a rank-1 tensor.")
+    if not 1 <= neighbors <= feature_bank.size(0):
+        raise ValueError("neighbors must be in [1, feature-bank size].")
+    if chunks < 1:
+        raise ValueError("chunks must be positive.")
+    if labels.numel() and (int(labels.min()) < 0 or int(labels.max()) >= num_classes):
+        raise ValueError("labels contain an invalid class index.")
 
-    counts = torch.tensor(
-        [torch.sum(labels == class_id).item() for class_id in range(num_classes)]
-    ).to(feature_bank.device) + 1e-10
+    counts = torch.bincount(labels, minlength=num_classes).to(feature_bank.dtype) + 1e-10
     class_prior = counts / counts.sum()
-    split = np.linspace(0, len(current_features), chunks + 1, dtype=int)
     normalized_bank = F.normalize(feature_bank, dim=1)
+    feature_bank_transposed = normalized_bank.T
+    chunk_size = max(1, (len(current_features) + chunks - 1) // chunks)
     score_parts: list[Tensor] = []
 
-    for chunk_id in range(chunks):
-        if feature_bank.device.type == "cuda":
-            torch.cuda.empty_cache()
-        start, end = int(split[chunk_id]), int(split[chunk_id + 1])
-        if start == end:
-            continue
+    for start in range(0, len(current_features), chunk_size):
+        end = min(start + chunk_size, len(current_features))
         score_parts.append(
             hard_knn_scores(
                 current_features[start:end],
-                normalized_bank.T,
+                feature_bank_transposed,
                 labels,
                 num_classes,
                 neighbors,

@@ -9,7 +9,7 @@ from PIL import Image
 from torch import Tensor
 from torchvision import transforms
 
-from utils.autoaugment import CIFAR10Policy
+from setting.autoaugment import CIFAR10Policy
 
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -34,15 +34,29 @@ class TwoStrongViews:
         return [self.strong_transform(image), self.strong_transform(image)]
 
 
-class WeakStrongViews:
-    """Weak then strong: the exact order expected by feature consistency."""
+class AllSampleViews:
+    """전체 데이터 branch의 weak/strong view 묶음.
 
-    def __init__(self, weak_transform: ImageTransform, strong_transform: ImageTransform) -> None:
+    LSL이 꺼지면 공식 SSR과 같은 ``[weak, strong]``만 생성한다. 켜지면
+    structural mixup 전용 independent strong view를 하나 더 생성한다.
+    """
+
+    def __init__(
+        self,
+        weak_transform: ImageTransform,
+        strong_transform: ImageTransform,
+        *,
+        include_structural_view: bool,
+    ) -> None:
         self.weak_transform = weak_transform
         self.strong_transform = strong_transform
+        self.include_structural_view = include_structural_view
 
     def __call__(self, image: Image.Image) -> list[Tensor]:
-        return [self.weak_transform(image), self.strong_transform(image)]
+        views = [self.weak_transform(image), self.strong_transform(image)]
+        if self.include_structural_view:
+            views.append(self.strong_transform(image))
+        return views
 
 
 def build_cifar10_transforms() -> CIFAR10Transforms:

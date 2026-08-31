@@ -1,41 +1,25 @@
-"""CIFAR-10 SSR training loop with the official epoch-level mechanism intact."""
+"""CIFAR-10 SSR/LSL 실행 orchestration."""
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch import Tensor
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
 from log.common import JsonlWriter, atomic_torch_save, write_config
 from setting.config import ExperimentConfig
 from setting.data import CIFAR10Data, build_cifar10_data
 from setting.model import SSRNetworks, build_ssr_networks
-from ssr.losses import mixup_two_views, negative_cosine_similarity, soft_cross_entropy
+from ssr.evaluation import evaluate_epoch, selection_metrics
 from ssr.sampler import ClassBalancedSampler
-from ssr.selection import SelectionResult, select_samples
-
-
-@dataclass(slots=True)
-class Average:
-    total: float = 0.0
-    count: int = 0
-
-    def update(self, value: float, count: int = 1) -> None:
-        self.total += value * count
-        self.count += count
-
-    @property
-    def value(self) -> float:
-        return self.total / self.count if self.count else 0.0
+from ssr.selection import SelectionResult
+from ssr.trainer import test_accuracy, train_epoch
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,25 +30,34 @@ class EpochLoaders:
 
 
 def seed_everything(seed: int) -> None:
-    """Preserve the official SSR random and cuDNN setup."""
+    """전역 config seed를 Python, NumPy, PyTorch, CUDA에 동일 적용."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = True
 
 
-def _loader_options(config: ExperimentConfig, device: torch.device) -> dict[str, Any]:
-    return {
+def _loader_options(
+    config: ExperimentConfig,
+    device: torch.device,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
         "batch_size": config.training.batch_size,
         "num_workers": config.training.num_workers,
         "pin_memory": device.type == "cuda",
     }
+    if config.training.num_workers > 0:
+        options.update(
+            prefetch_factor=config.training.prefetch_factor,
+            persistent_workers=config.training.persistent_workers,
+        )
+    return options
 
 
-def build_epoch_loaders(
+def _build_epoch_loaders(
     data: CIFAR10Data,
     config: ExperimentConfig,
     device: torch.device,
@@ -82,7 +75,7 @@ def build_epoch_loaders(
     )
 
 
-def build_selected_loader(
+def _build_selected_loader(
     data: CIFAR10Data,
     selection: SelectionResult,
     config: ExperimentConfig,
@@ -90,7 +83,8 @@ def build_selected_loader(
 ) -> DataLoader:
     subset = Subset(data.selected_train, selection.selected_indices.detach().cpu())
     sampler = ClassBalancedSampler(
-        selection.modified_labels[selection.selected_indices], num_classes=10
+        selection.modified_labels[selection.selected_indices].detach().cpu(),
+        num_classes=10,
     )
     loader = DataLoader(
         subset,
@@ -100,172 +94,22 @@ def build_selected_loader(
     )
     if len(loader) == 0:
         raise RuntimeError(
-            "The class-balanced selected loader has no full batch. "
-            "SSR cannot perform its supervised update for this epoch."
+            "The class-balanced selected loader has no full batch; "
+            "SSR cannot perform its supervised update."
         )
     return loader
 
 
-@torch.no_grad()
-def extract_features_and_predictions(
-    loader: DataLoader,
-    networks: SSRNetworks,
-    device: torch.device,
-) -> tuple[Tensor, Tensor]:
-    networks.eval()
-    feature_parts: list[Tensor] = []
-    logit_parts: list[Tensor] = []
-    for images, _, _, _ in tqdm(loader, desc="Feature extraction", leave=False):
-        images = images.to(device, non_blocking=True)
-        features = networks.encoder(images)
-        feature_parts.append(features)
-        logit_parts.append(networks.classifier(features))
-    normalized_features = F.normalize(torch.cat(feature_parts, dim=0), dim=1)
-    probabilities = torch.softmax(torch.cat(logit_parts, dim=0), dim=1)
-    return normalized_features, probabilities
-
-
-def evaluate_and_select(
-    loader: DataLoader,
-    networks: SSRNetworks,
-    noisy_labels: Tensor,
-    config: ExperimentConfig,
-    device: torch.device,
-) -> SelectionResult:
-    normalized_features, probabilities = extract_features_and_predictions(
-        loader, networks, device
-    )
-    return select_samples(
-        normalized_features,
-        noisy_labels,
-        probabilities,
-        relabel_threshold=config.ssr.relabel_threshold,
-        selection_threshold=config.ssr.selection_threshold,
-        neighbors=config.ssr.neighbors,
-        chunks=config.ssr.knn_chunks,
-    )
-
-
-def train_epoch(
-    selected_loader: DataLoader,
-    all_samples_loader: DataLoader,
-    modified_labels: Tensor,
-    networks: SSRNetworks,
-    optimizer: SGD,
-    config: ExperimentConfig,
-    device: torch.device,
-    epoch: int,
-) -> tuple[float, float]:
-    networks.train()
-    supervised_average = Average()
-    consistency_average = Average()
-    selected_iterator = iter(selected_loader)
-    progress = tqdm(all_samples_loader, desc=f"Train {epoch + 1}", leave=False)
-
-    for (weak_strong_views, _, _, _) in progress:
-        try:
-            strong_views, _, _, indices = next(selected_iterator)
-        except StopIteration:
-            selected_iterator = iter(selected_loader)
-            strong_views, _, _, indices = next(selected_iterator)
-
-        first_strong = strong_views[0].to(device, non_blocking=True)
-        second_strong = strong_views[1].to(device, non_blocking=True)
-        labels = modified_labels[indices.to(device)]
-        mixed_inputs, mixed_targets, _ = mixup_two_views(
-            first_strong,
-            second_strong,
-            labels,
-            num_classes=10,
-            alpha=config.ssr.mixup_alpha,
-        )
-        logits = networks.classifier(networks.encoder(mixed_inputs))
-        supervised_loss = soft_cross_entropy(logits, mixed_targets)
-
-        weak = weak_strong_views[0].to(device, non_blocking=True)
-        strong = weak_strong_views[1].to(device, non_blocking=True)
-        weak_features = networks.encoder(weak)
-        strong_features = networks.encoder(strong)
-        weak_projection = networks.projector(weak_features)
-        strong_projection = networks.projector(strong_features)
-
-        # The weak prediction is unused by the loss, but its forward pass is
-        # part of upstream SSR and updates predictor BatchNorm statistics.
-        _weak_prediction = networks.predictor(weak_projection)
-        strong_prediction = networks.predictor(strong_projection)
-        consistency_loss = negative_cosine_similarity(
-            strong_prediction, weak_projection
-        )
-        loss = (
-            supervised_loss
-            + config.ssr.feature_consistency_weight * consistency_loss
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        supervised_average.update(supervised_loss.item())
-        consistency_average.update(consistency_loss.item())
-        progress.set_postfix(
-            lr=f"{optimizer.param_groups[0]['lr']:.6f}",
-            ce=f"{supervised_average.value:.4f}",
-            fc=f"{consistency_average.value:.4f}",
-        )
-    return supervised_average.value, consistency_average.value
-
-
-@torch.no_grad()
-def test_accuracy(
-    loader: DataLoader,
-    networks: SSRNetworks,
-    device: torch.device,
-) -> float:
-    networks.eval()
-    accuracy = Average()
-    for images, labels, _ in tqdm(loader, desc="Test", leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        predictions = networks.classifier(networks.encoder(images)).argmax(dim=1)
-        batch_accuracy = predictions.eq(labels).sum().item() / images.size(0)
-        accuracy.update(batch_accuracy, images.size(0))
-    return accuracy.value
-
-
-def selection_metrics(
-    selection: SelectionResult,
-    noisy_labels: Tensor,
-    clean_labels: Tensor,
-) -> dict[str, int | float]:
-    selected = selection.selected_indices
-    rejected = selection.rejected_indices
-    modified = selection.modified_labels
-    relabelled = selection.relabelled_indices
-    return {
-        "selected": int(selected.numel()),
-        "rejected": int(rejected.numel()),
-        "tp": int(modified[selected].eq(clean_labels[selected]).sum().item()),
-        "fp": int(modified[selected].ne(clean_labels[selected]).sum().item()),
-        "tn": int(modified[rejected].ne(clean_labels[rejected]).sum().item()),
-        "fn": int(modified[rejected].eq(clean_labels[rejected]).sum().item()),
-        "relabelled": int(relabelled.numel()),
-        "relabel_correct": int(modified[relabelled].eq(clean_labels[relabelled]).sum().item()),
-        "relabel_original_correct": int(
-            noisy_labels[relabelled].eq(clean_labels[relabelled]).sum().item()
-        ),
-        "confidence_mean": float(selection.confidences.mean().item()),
-        "confidence_min": float(selection.confidences.min().item()),
-        "confidence_max": float(selection.confidences.max().item()),
-    }
-
-
-def checkpoint_state(
+def _checkpoint_state(
     epoch: int,
     networks: SSRNetworks,
     optimizer: SGD,
+    config: ExperimentConfig,
 ) -> dict[str, Any]:
     return {
         "cur_epoch": epoch,
+        "model_name": config.model.name,
+        "structural_labels_enabled": config.structural_labels.enabled,
         "classifier": networks.classifier.state_dict(),
         "encoder": networks.encoder.state_dict(),
         "proj_head": networks.projector.state_dict(),
@@ -274,19 +118,11 @@ def checkpoint_state(
     }
 
 
-def run(config: ExperimentConfig) -> float:
-    """Run SSR: relabel -> structural select -> train, from epoch zero."""
-    config.validate()
-    device = config.resolve_device()
-    seed_everything(config.training.seed)
-    write_config(config, config.run_dir)
-
-    data = build_cifar10_data(config.data, device)
-    loaders = build_epoch_loaders(data, config, device)
-    noisy_labels = data.noisy_labels.to(device)
-    clean_labels = data.clean_labels.to(device)
-    networks = build_ssr_networks(device)
-    optimizer = SGD(
+def _build_optimizer(
+    networks: SSRNetworks,
+    config: ExperimentConfig,
+) -> SGD:
+    return SGD(
         [
             {"params": networks.encoder.parameters()},
             {"params": networks.classifier.parameters()},
@@ -297,6 +133,26 @@ def run(config: ExperimentConfig) -> float:
         weight_decay=config.training.weight_decay,
         momentum=config.training.momentum,
     )
+
+
+def run(config: ExperimentConfig) -> float:
+    """warm-up 없이 매 epoch relabel -> select -> optional LSL -> train."""
+    config.validate()
+    device = config.resolve_device()
+    seed_everything(config.seed)
+    write_config(config, config.run_dir)
+
+    data = build_cifar10_data(
+        config.data,
+        device,
+        seed=config.seed,
+        structural_labels_enabled=config.structural_labels.enabled,
+    )
+    loaders = _build_epoch_loaders(data, config, device)
+    noisy_labels = data.noisy_labels.to(device)
+    clean_labels = data.clean_labels.to(device)
+    networks = build_ssr_networks(config.model, device)
+    optimizer = _build_optimizer(networks, config)
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=config.training.epochs,
@@ -314,18 +170,25 @@ def run(config: ExperimentConfig) -> float:
     best_accuracy = 0.0
     with JsonlWriter(config.run_dir / "metrics.jsonl") as metrics_writer:
         for epoch in range(config.training.epochs):
-            selection = evaluate_and_select(
+            supervision = evaluate_epoch(
                 loaders.evaluation,
                 networks,
                 noisy_labels,
                 config,
                 device,
             )
-            selected_loader = build_selected_loader(data, selection, config, device)
-            supervised_loss, consistency_loss = train_epoch(
+            selected_loader = _build_selected_loader(
+                data,
+                supervision.selection,
+                config,
+                device,
+            )
+            learning_rate = float(optimizer.param_groups[0]["lr"])
+            losses = train_epoch(
                 selected_loader,
                 loaders.all_samples,
-                selection.modified_labels,
+                supervision.selection.modified_labels,
+                supervision.structural_targets,
                 networks,
                 optimizer,
                 config,
@@ -334,17 +197,21 @@ def run(config: ExperimentConfig) -> float:
             )
             current_accuracy = test_accuracy(loaders.test, networks, device)
             scheduler.step()
+
             is_best = current_accuracy > best_accuracy
             if is_best:
                 best_accuracy = current_accuracy
             values = {
                 "epoch": epoch,
-                "learning_rate": optimizer.param_groups[0]["lr"],
-                "supervised_loss": supervised_loss,
-                "feature_consistency_loss": consistency_loss,
+                "learning_rate": learning_rate,
+                **asdict(losses),
                 "test_accuracy": current_accuracy,
                 "best_accuracy": best_accuracy,
-                **selection_metrics(selection, noisy_labels, clean_labels),
+                **selection_metrics(
+                    supervision.selection,
+                    noisy_labels,
+                    clean_labels,
+                ),
             }
             metrics_writer.write(values)
             print(
@@ -355,12 +222,12 @@ def run(config: ExperimentConfig) -> float:
 
             if is_best:
                 atomic_torch_save(
-                    checkpoint_state(epoch, networks, optimizer),
+                    _checkpoint_state(epoch, networks, optimizer, config),
                     config.run_dir / "best.pt",
                 )
 
     atomic_torch_save(
-        checkpoint_state(config.training.epochs, networks, optimizer),
+        _checkpoint_state(config.training.epochs - 1, networks, optimizer, config),
         config.run_dir / "last.pt",
     )
     return best_accuracy

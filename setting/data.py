@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import random
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -17,7 +14,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from torchvision.datasets import CIFAR10
 
-from setting.augmentation import TwoStrongViews, WeakStrongViews, build_cifar10_transforms
+from log.common import atomic_torch_save
+from setting.augmentation import AllSampleViews, TwoStrongViews, build_cifar10_transforms
 from setting.config import DataConfig
 
 
@@ -61,7 +59,11 @@ def inject_instance_dependent_noise(
         return labels.clone(), torch.zeros_like(labels, dtype=torch.bool)
 
     if device is None:
-        compute_device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
+        compute_device = (
+            torch.device("cuda", 0)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
     else:
         compute_device = torch.device(device)
     features = images.detach().reshape(images.size(0), -1).to(
@@ -136,23 +138,14 @@ class CIFAR10TrainDataset(Dataset):
     def __init__(
         self,
         images: np.ndarray,
-        noisy_labels: Tensor,
-        clean_labels: Tensor,
         transform: Callable[[Image.Image], object],
     ) -> None:
         self.images = images
-        self.noisy_labels = noisy_labels
-        self.clean_labels = clean_labels
         self.transform = transform
 
-    def __getitem__(self, index: int) -> tuple[object, Tensor, Tensor, int]:
+    def __getitem__(self, index: int) -> tuple[object, int]:
         image = Image.fromarray(self.images[index])
-        return (
-            self.transform(image),
-            self.noisy_labels[index],
-            self.clean_labels[index],
-            index,
-        )
+        return self.transform(image), index
 
     def __len__(self) -> int:
         return len(self.images)
@@ -169,8 +162,9 @@ class CIFAR10TestDataset(Dataset):
         self.clean_labels = clean_labels
         self.transform = transform
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, int]:
-        return self.transform(Image.fromarray(self.images[index])), self.clean_labels[index], index
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        image = self.transform(Image.fromarray(self.images[index]))
+        return image, self.clean_labels[index]
 
     def __len__(self) -> int:
         return len(self.images)
@@ -187,41 +181,32 @@ class CIFAR10Data:
     noise_mask: Tensor
 
 
-def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
-        temporary_path = Path(handle.name)
-    try:
-        torch.save(payload, temporary_path)
-        os.replace(temporary_path, path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-
-
 def _load_or_create_noisy_labels(
     images: np.ndarray,
     clean_labels: Tensor,
     config: DataConfig,
     device: torch.device,
+    seed: int,
 ) -> tuple[Tensor, Tensor]:
-    if config.noise_file.exists():
-        artifact = torch.load(config.noise_file, map_location="cpu", weights_only=True)
+    noise_file = config.noise_file(seed)
+    if noise_file.exists():
+        artifact = torch.load(noise_file, map_location="cpu", weights_only=True)
         expected_metadata = {
             "dataset": "CIFAR10",
             "noise_kind": config.noise_kind,
             "noise_rate": config.noise_rate,
-            "noise_seed": config.noise_seed,
+            "seed": seed,
         }
         if config.noise_kind == "idn":
             expected_metadata["idn_flip_rate_std"] = config.idn_flip_rate_std
         for key, expected in expected_metadata.items():
             if artifact.get(key) != expected:
                 raise RuntimeError(
-                    f"Noise artifact metadata mismatch for {key}: {config.noise_file}"
+                    f"Noise artifact metadata mismatch for {key}: {noise_file}"
                 )
         noisy_labels = artifact["noisy_labels"].to(torch.long).contiguous()
         if not torch.equal(artifact["clean_labels"].to(torch.long), clean_labels):
-            raise RuntimeError(f"Noise artifact does not match CIFAR-10 labels: {config.noise_file}")
+            raise RuntimeError(f"Noise artifact does not match CIFAR-10 labels: {noise_file}")
         return noisy_labels, noisy_labels.ne(clean_labels).contiguous()
 
     if config.noise_kind == "idn":
@@ -232,7 +217,7 @@ def _load_or_create_noisy_labels(
             noise_rate=config.noise_rate,
             flip_rate_std=config.idn_flip_rate_std,
             num_classes=NUM_CLASSES,
-            seed=config.noise_seed,
+            seed=seed,
             device=device,
         )
     else:
@@ -240,25 +225,31 @@ def _load_or_create_noisy_labels(
             clean_labels,
             noise_kind=config.noise_kind,
             noise_rate=config.noise_rate,
-            seed=config.noise_seed,
+            seed=seed,
         )
 
-    _atomic_torch_save(
+    atomic_torch_save(
         {
             "dataset": "CIFAR10",
             "noise_kind": config.noise_kind,
             "noise_rate": config.noise_rate,
-            "noise_seed": config.noise_seed,
+            "seed": seed,
             "idn_flip_rate_std": config.idn_flip_rate_std,
             "noisy_labels": noisy_labels,
             "clean_labels": clean_labels,
         },
-        config.noise_file,
+        noise_file,
     )
     return noisy_labels, noise_mask
 
 
-def build_cifar10_data(config: DataConfig, device: torch.device) -> CIFAR10Data:
+def build_cifar10_data(
+    config: DataConfig,
+    device: torch.device,
+    *,
+    seed: int,
+    structural_labels_enabled: bool,
+) -> CIFAR10Data:
     """Build the four dataset views needed by SSR from one CIFAR-10 copy."""
     train_source = CIFAR10(root=config.root, train=True, download=config.download)
     test_source = CIFAR10(root=config.root, train=False, download=config.download)
@@ -267,25 +258,30 @@ def build_cifar10_data(config: DataConfig, device: torch.device) -> CIFAR10Data:
     clean_labels = torch.as_tensor(train_source.targets, dtype=torch.long)
     test_labels = torch.as_tensor(test_source.targets, dtype=torch.long)
     noisy_labels, noise_mask = _load_or_create_noisy_labels(
-        train_images, clean_labels, config, device
+        train_images,
+        clean_labels,
+        config,
+        device,
+        seed,
     )
     augmentations = build_cifar10_transforms()
 
     return CIFAR10Data(
         selected_train=CIFAR10TrainDataset(
             train_images,
-            noisy_labels,
-            clean_labels,
             TwoStrongViews(augmentations.strong),
         ),
         evaluation_train=CIFAR10TrainDataset(
-            train_images, noisy_labels, clean_labels, augmentations.weak
+            train_images,
+            augmentations.weak,
         ),
         all_train=CIFAR10TrainDataset(
             train_images,
-            noisy_labels,
-            clean_labels,
-            WeakStrongViews(augmentations.weak, augmentations.strong),
+            AllSampleViews(
+                augmentations.weak,
+                augmentations.strong,
+                include_structural_view=structural_labels_enabled,
+            ),
         ),
         test=CIFAR10TestDataset(test_images, test_labels, augmentations.none),
         noisy_labels=noisy_labels,

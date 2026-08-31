@@ -1,7 +1,7 @@
 [project]
 name = "structural-labels"
 version = "0.1.0"
-description = "CIFAR-10 SSR baseline for Learning with Structural Labels"
+description = "CIFAR-10 SSR and Learning with Structural Labels implementation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
