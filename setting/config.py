@@ -11,28 +11,17 @@ from typing import Literal
 import torch
 
 
-# -----------------------------------------------------------------------------
-# 사용자 설정 영역
-# -----------------------------------------------------------------------------
-# 프로젝트를 다른 서버로 옮길 때 이 한 줄만 바꾼다.
-# 예: PROJECT_ROOT = Path("/workspace/SSR-LSL").expanduser().resolve()
+
+# PROJECT_ROOT = Path("/workspace/SSR-LSL").expanduser().resolve()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 아래 GPU preset은 처리량을 높이기 위한 시작값이며
-# 논문 재현 기본값은 아니다.
-# 논문과 직접 비교할 때는 현재 기본값(batch=128, lr=0.02, chunk=10)을 유지한다.
-#
-# RTX 5080 단일 GPU (16 GB):
-#   batch_size=256, learning_rate=0.04, num_workers=8, prefetch_factor=4,
+# 논문 기본값(batch=128, lr=0.02, chunk=10)
+# RTX 5080 (16 GB):
+#   batch_size=256, num_workers=8, prefetch_factor=4,
 #   SSR/LSL knn_chunks=8
-# H100 NVL 단일 GPU (GPU당 94 GB):
-#   batch_size=512, learning_rate=0.08, num_workers=16, prefetch_factor=4,
+# H100 NVL (94 GB):
+#   batch_size=512, num_workers=16, prefetch_factor=4,
 #   SSR/LSL knn_chunks=2
-# H100 NVL 두 장의 합산 188 GB는 현재 단일 GPU 코드에서 자동으로
-# 사용되지 않는다. num_workers는 서버의 CPU core와 storage에 맞춰 조절한다.
-# batch size를 키운 preset은 linear LR scaling을 적용한 값이므로
-# 최종 성능은 재검증한다.
-# -----------------------------------------------------------------------------
 
 NoiseKind = Literal["symmetric", "asymmetric", "idn"]
 ModelName = Literal["preact_resnet18", "cifar_resnet18", "cifar_resnet34"]

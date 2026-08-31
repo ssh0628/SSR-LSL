@@ -51,7 +51,6 @@ L = L_ce + lambda_fc * L_fc + lambda_st * L_st
 - Backbone: `model.name`
 - Noise: `data.noise_kind`, `data.noise_rate`
 - Seed: `seed`
-- GPU별 권장값: config 상단 주석 참고
 
 논문 기본값:
 
@@ -62,6 +61,41 @@ L = L_ce + lambda_fc * L_fc + lambda_st * L_st
 - `lambda_fc`: `1.0`
 - `lambda_st`: `1.0`
 - mixup alpha: `4.0`
+
+## GPU 설정
+
+논문 재현:
+
+- batch size: `128`
+- learning rate: `0.02`
+- workers: `4`
+- SSR k-NN chunks: `10`
+- LSL k-NN chunks: `10`
+
+RTX 5080 16GB:
+
+- batch size: `256`
+- learning rate: `0.04`
+- workers: `8`
+- prefetch factor: `4`
+- SSR k-NN chunks: `8`
+- LSL k-NN chunks: `8`
+
+H100 NVL 94GB:
+
+- batch size: `512`
+- learning rate: `0.08`
+- workers: `16`
+- prefetch factor: `4`
+- SSR k-NN chunks: `2`
+- LSL k-NN chunks: `2`
+
+주의:
+
+- GPU 설정: 처리량 기준 시작값
+- 논문 비교: 논문 재현값 사용
+- worker 수: CPU core와 storage에 맞춰 조절
+- H100 NVL 2장: 현재 코드는 자동 병렬화하지 않음
 
 ## 실행
 
