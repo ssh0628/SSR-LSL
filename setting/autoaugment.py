@@ -3,10 +3,77 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Callable
 
 import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
+
+
+def _rotate_with_fill(image: Image.Image, magnitude: float) -> Image.Image:
+    rotated = image.convert("RGBA").rotate(magnitude)
+    return Image.composite(
+        rotated,
+        Image.new("RGBA", rotated.size, (128,) * 4),
+        rotated,
+    ).convert(image.mode)
+
+
+def _apply_operation(
+    name: str,
+    image: Image.Image,
+    magnitude: float,
+    fill_color: tuple[int, int, int],
+) -> Image.Image:
+    """pickle 가능한 module-level AutoAugment operation dispatcher."""
+    if name == "sheary":
+        direction = random.choice([-1, 1])
+        return image.transform(
+            image.size,
+            Image.AFFINE,
+            (1, 0, 0, magnitude * direction, 1, 0),
+            Image.BICUBIC,
+            fillcolor=fill_color,
+        )
+    if name == "translatex":
+        direction = random.choice([-1, 1])
+        return image.transform(
+            image.size,
+            Image.AFFINE,
+            (1, 0, magnitude * image.size[0] * direction, 0, 1, 0),
+            fillcolor=fill_color,
+        )
+    if name == "translatey":
+        direction = random.choice([-1, 1])
+        return image.transform(
+            image.size,
+            Image.AFFINE,
+            (1, 0, 0, 0, 1, magnitude * image.size[1] * direction),
+            fillcolor=fill_color,
+        )
+    if name == "rotate":
+        return _rotate_with_fill(image, magnitude)
+    if name == "color":
+        direction = random.choice([-1, 1])
+        return ImageEnhance.Color(image).enhance(1 + magnitude * direction)
+    if name == "posterize":
+        return ImageOps.posterize(image, magnitude)
+    if name == "solarize":
+        return ImageOps.solarize(image, magnitude)
+    if name == "contrast":
+        direction = random.choice([-1, 1])
+        return ImageEnhance.Contrast(image).enhance(1 + magnitude * direction)
+    if name == "sharpness":
+        direction = random.choice([-1, 1])
+        return ImageEnhance.Sharpness(image).enhance(1 + magnitude * direction)
+    if name == "brightness":
+        direction = random.choice([-1, 1])
+        return ImageEnhance.Brightness(image).enhance(1 + magnitude * direction)
+    if name == "autocontrast":
+        return ImageOps.autocontrast(image)
+    if name == "equalize":
+        return ImageOps.equalize(image)
+    if name == "invert":
+        return ImageOps.invert(image)
+    raise ValueError(f"Unknown AutoAugment operation: {name!r}.")
 
 
 class _SubPolicy:
@@ -36,68 +103,31 @@ class _SubPolicy:
             "invert": [0] * 10,
         }
 
-        def rotate_with_fill(image: Image.Image, magnitude: float) -> Image.Image:
-            rotated = image.convert("RGBA").rotate(magnitude)
-            return Image.composite(
-                rotated,
-                Image.new("RGBA", rotated.size, (128,) * 4),
-                rotated,
-            ).convert(image.mode)
-
-        operations: dict[str, Callable[[Image.Image, float], Image.Image]] = {
-            "sheary": lambda image, magnitude: image.transform(
-                image.size,
-                Image.AFFINE,
-                (1, 0, 0, magnitude * random.choice([-1, 1]), 1, 0),
-                Image.BICUBIC,
-                fillcolor=fill_color,
-            ),
-            "translatex": lambda image, magnitude: image.transform(
-                image.size,
-                Image.AFFINE,
-                (1, 0, magnitude * image.size[0] * random.choice([-1, 1]), 0, 1, 0),
-                fillcolor=fill_color,
-            ),
-            "translatey": lambda image, magnitude: image.transform(
-                image.size,
-                Image.AFFINE,
-                (1, 0, 0, 0, 1, magnitude * image.size[1] * random.choice([-1, 1])),
-                fillcolor=fill_color,
-            ),
-            "rotate": rotate_with_fill,
-            "color": lambda image, magnitude: ImageEnhance.Color(image).enhance(
-                1 + magnitude * random.choice([-1, 1])
-            ),
-            "posterize": lambda image, magnitude: ImageOps.posterize(image, magnitude),
-            "solarize": lambda image, magnitude: ImageOps.solarize(image, magnitude),
-            "contrast": lambda image, magnitude: ImageEnhance.Contrast(image).enhance(
-                1 + magnitude * random.choice([-1, 1])
-            ),
-            "sharpness": lambda image, magnitude: ImageEnhance.Sharpness(image).enhance(
-                1 + magnitude * random.choice([-1, 1])
-            ),
-            "brightness": lambda image, magnitude: ImageEnhance.Brightness(image).enhance(
-                1 + magnitude * random.choice([-1, 1])
-            ),
-            "autocontrast": lambda image, _: ImageOps.autocontrast(image),
-            "equalize": lambda image, _: ImageOps.equalize(image),
-            "invert": lambda image, _: ImageOps.invert(image),
-        }
-
         name1 = operation1.lower()
         name2 = operation2.lower()
         self.probability1 = probability1
-        self.operation1 = operations[name1]
+        self.operation1 = name1
         self.magnitude1 = ranges[name1][magnitude_index1]
         self.probability2 = probability2
-        self.operation2 = operations[name2]
+        self.operation2 = name2
         self.magnitude2 = ranges[name2][magnitude_index2]
+        self.fill_color = fill_color
 
     def __call__(self, image: Image.Image) -> Image.Image:
         if random.random() < self.probability1:
-            image = self.operation1(image, self.magnitude1)
+            image = _apply_operation(
+                self.operation1,
+                image,
+                self.magnitude1,
+                self.fill_color,
+            )
         if random.random() < self.probability2:
-            image = self.operation2(image, self.magnitude2)
+            image = _apply_operation(
+                self.operation2,
+                image,
+                self.magnitude2,
+                self.fill_color,
+            )
         return image
 
 
