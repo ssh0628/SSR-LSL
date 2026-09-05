@@ -15,9 +15,12 @@ import torch
 # PROJECT_ROOT = Path("/root/project/ssr").expanduser().resolve()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# - ConvNeXtV2-Tiny / 224px 기준 GPU 시작값
-# - RTX 5080 16 GB: batch_size=16, num_workers=8
-# - H100 NVL 94 GB: batch_size=64, num_workers=16
+# - ConvNeXtV2-Tiny / 224px / BF16 AMP 기준
+# - RTX 5080 16 GB: batch_size=16, eval_batch_size=64, prefetch_factor=1
+# - 현재 서버: H100 NVL 1 GPU / 16 vCPU / RAM 200 GB
+# - H100 설정: batch_size=512, eval_batch_size=1024, prefetch_factor=4
+# - 학습 worker: 8개 × 두 loader = 16개; evaluation worker=8
+# - 처리량 우선 설정; 서버 실측 최적값은 아님
 # - LR: GPU에 따른 자동 변경 없음
 OptimizerName = Literal["sgd", "adamw"]
 
@@ -56,7 +59,7 @@ class DataConfig:
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # RGB 평균
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # RGB 표준편차
     allow_truncated_images: bool = True  # 잘린 이미지 decoder 재시도
-    verify_images: bool = True  # 모델 생성 전 전체 이미지 decode 검사
+    verify_images: bool = False  # 모델 생성 전 전체 이미지 decode 검사
     image_check_workers: int = 8  # 사전 검사 worker 수
 
     @property
@@ -226,7 +229,11 @@ class TrainingConfig:
     """일반 이미지 데이터셋 학습 설정."""
 
     epochs: int = 200  # 학습 epoch 수; 별도 warm-up 없음
-    batch_size: int = 64  # DataLoader mini-batch 크기
+    batch_size: int = 512  # 학습 mini-batch; mixup forward 크기=1024
+    eval_batch_size: int = 1024  # feature 추출·validation·test 배치; FP32 유지
+    amp: bool = True  # CUDA 학습 forward: BF16; CPU/MPS: 미적용
+    channels_last: bool = True  # CUDA encoder·이미지 메모리 배치 최적화
+    fused_optimizer: bool = True  # CUDA AdamW fused kernel; 나머지 환경 미적용
     learning_rate: float = 1e-3  # classifier/projector/predictor 초기 LR
     # - encoder 전용 초기 LR
     # - None: head와 같은 learning_rate
@@ -236,11 +243,14 @@ class TrainingConfig:
     weight_decay: float = 0.1  # weight decay
     # - cosine 최저 LR / 각 parameter group 초기 LR
     scheduler_eta_min_ratio: float = 1e-3
-    num_workers: int = 16  # DataLoader worker 수
+    num_workers: int = 8  # 학습 loader당 worker 수; 두 loader 합계 16개
+    eval_num_workers: int = 8  # feature 추출·validation·test worker 수
     # - worker당 미리 준비할 batch 수; workers=0이면 미사용
-    prefetch_factor: int = 2
+    # - RAM 200 GB 활용; 두 학습 loader에 각각 최대 32 batch 준비
+    prefetch_factor: int = 4
     # - epoch 간 worker 유지; selected loader는 매 epoch 재생성
     persistent_workers: bool = True
+    log_interval: int = 20  # loss 진행 표시 갱신 간격; step 단위
 
     def validate(self) -> None:
         if self.epochs < 1:
@@ -249,6 +259,8 @@ class TrainingConfig:
             raise ValueError(
                 "training.batch_size must be at least 2 for the SSR BatchNorm heads."
             )
+        if self.eval_batch_size < 1:
+            raise ValueError("training.eval_batch_size must be positive.")
         if not isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("training.learning_rate must be positive.")
         if self.encoder_learning_rate is not None and (
@@ -263,10 +275,12 @@ class TrainingConfig:
             raise ValueError("training.weight_decay must not be negative.")
         if not 0.0 <= self.scheduler_eta_min_ratio <= 1.0:
             raise ValueError("training.scheduler_eta_min_ratio must be in [0, 1].")
-        if self.num_workers < 0:
-            raise ValueError("training.num_workers must not be negative.")
+        if self.num_workers < 0 or self.eval_num_workers < 0:
+            raise ValueError("training worker counts must not be negative.")
         if self.prefetch_factor < 1:
             raise ValueError("training.prefetch_factor must be positive.")
+        if self.log_interval < 1:
+            raise ValueError("training.log_interval must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +288,10 @@ class RuntimeConfig:
     """실행·저장 설정."""
 
     device: str = "auto"  # auto: CUDA → MPS → CPU
+    # - False: cuDNN autotune 활성화; 속도 우선
+    # - True: cuDNN deterministic, autotune 해제; 완전한 재현성 보장은 아님
+    # - 두 모드 모두 seed=0 유지; AMP 결과는 기존 FP32와 차이 가능
+    deterministic: bool = False
     output_root: Path = field(default_factory=lambda: PROJECT_ROOT / "outputs")  # 결과 저장 루트
     run_id: str | None = None  # None: 실행 시각 ID; 중복 지정 ID 거부
 

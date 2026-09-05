@@ -14,6 +14,7 @@ from tqdm import tqdm
 from lsl import structural_mixup_loss
 from setting.config import ExperimentConfig
 from setting.model import SSRNetworks
+from setting.precision import PrecisionPolicy, full_precision
 from ssr.losses import (
     mixup_hard_label_views,
     negative_cosine_similarity,
@@ -61,13 +62,16 @@ def train_epoch(
     epoch: int,
 ) -> TrainingLosses:
     networks.train()
+    training = getattr(config, "training", None)
+    precision = PrecisionPolicy.from_config(training, device)
+    log_interval = getattr(training, "log_interval", 20)
     supervised_average = _RunningAverage()
     consistency_average = _RunningAverage()
     structural_average = _RunningAverage() if structural_targets is not None else None
     selected_iterator = iter(selected_loader)
     progress = tqdm(all_samples_loader, desc=f"Train {epoch + 1}", leave=False)
 
-    for all_views, all_indices in progress:
+    for step, (all_views, all_indices) in enumerate(progress, start=1):
         try:
             selected_views, selected_indices = next(selected_iterator)
         except StopIteration:
@@ -76,8 +80,8 @@ def train_epoch(
 
         # Release the previous step's gradients before allocating activations.
         optimizer.zero_grad(set_to_none=True)
-        first_selected = selected_views[0].to(device, non_blocking=True)
-        second_selected = selected_views[1].to(device, non_blocking=True)
+        first_selected = precision.to_device(selected_views[0])
+        second_selected = precision.to_device(selected_views[1])
         selected_labels = modified_labels[selected_indices.to(device)]
         mixed_inputs, mixed_targets, _ = mixup_hard_label_views(
             first_selected,
@@ -86,7 +90,8 @@ def train_epoch(
             num_classes=config.data.num_classes,
             alpha=config.ssr.mixup_alpha,
         )
-        supervised_logits = networks.classifier(networks.encoder(mixed_inputs))
+        with precision.autocast():
+            supervised_logits = networks.classifier(networks.encoder(mixed_inputs))
         supervised_loss = soft_cross_entropy(supervised_logits, mixed_targets)
         supervised_value = _loss_value(supervised_loss, "supervised")
         # Additive loss gradients accumulate at the same parameter values.
@@ -96,19 +101,22 @@ def train_epoch(
         del supervised_logits, supervised_loss, mixed_inputs, mixed_targets
         del first_selected, second_selected, selected_labels
 
-        weak_view = all_views[0].to(device, non_blocking=True)
-        first_strong_view = all_views[1].to(device, non_blocking=True)
+        weak_view = precision.to_device(all_views[0])
+        first_strong_view = precision.to_device(all_views[1])
         # SSR stops gradients through its weak target. Train-mode BN updates
         # and stochastic forward calls are still performed in the same order.
-        with torch.no_grad():
+        # Separate AMP scopes prevent cached no-grad weights leaking to strong.
+        with torch.no_grad(), precision.autocast():
             weak_projection = networks.projector(networks.encoder(weak_view))
-        strong_projection = networks.projector(networks.encoder(first_strong_view))
+        with precision.autocast():
+            strong_projection = networks.projector(networks.encoder(first_strong_view))
 
         # p_weak는 loss에 직접 쓰이지 않지만
         # 공식 SSR의 predictor BN 갱신에 필요하다.
-        with torch.no_grad():
+        with torch.no_grad(), precision.autocast():
             networks.predictor(weak_projection)
-        strong_prediction = networks.predictor(strong_projection)
+        with precision.autocast():
+            strong_prediction = networks.predictor(strong_projection)
         consistency_loss = negative_cosine_similarity(
             strong_prediction,
             weak_projection,
@@ -122,16 +130,17 @@ def train_epoch(
         if structural_targets is not None:
             if len(all_views) != 3:
                 raise RuntimeError("LSL requires [weak, strong, strong] all-sample views.")
-            second_strong_view = all_views[2].to(device, non_blocking=True)
+            second_strong_view = precision.to_device(all_views[2])
             batch_structural_targets = structural_targets[all_indices.to(device)]
-            current_structural_loss = structural_mixup_loss(
-                networks.encoder,
-                networks.classifier,
-                first_strong_view,
-                second_strong_view,
-                batch_structural_targets,
-                mixup_alpha=config.ssr.mixup_alpha,
-            )
+            with precision.autocast():
+                current_structural_loss = structural_mixup_loss(
+                    networks.encoder,
+                    networks.classifier,
+                    first_strong_view,
+                    second_strong_view,
+                    batch_structural_targets,
+                    mixup_alpha=config.ssr.mixup_alpha,
+                )
             structural_value = _loss_value(current_structural_loss, "structural")
             (config.structural_labels.loss_weight * current_structural_loss).backward()
             structural_average.update(structural_value)
@@ -142,6 +151,8 @@ def train_epoch(
         optimizer.step()
         del first_strong_view
 
+        if step % log_interval != 0 and step != len(all_samples_loader):
+            continue
         encoder_learning_rate = optimizer.param_groups[0]["lr"]
         head_learning_rate = (
             optimizer.param_groups[1]["lr"]
@@ -175,14 +186,22 @@ def test_accuracy(
     device: torch.device,
     *,
     description: str = "Evaluation",
+    channels_last: bool = False,
 ) -> float:
     networks.eval()
+    device = torch.device(device)
+    precision = PrecisionPolicy(
+        device=device, channels_last=channels_last and device.type == "cuda"
+    )
     correct = torch.zeros((), dtype=torch.long, device=device)
     samples = 0
     for images, labels in tqdm(loader, desc=description, leave=False):
-        images = images.to(device, non_blocking=True)
+        images = precision.to_device(images)
+        if images.dtype in {torch.float16, torch.bfloat16}:
+            images = images.float()
         labels = labels.to(device, non_blocking=True)
-        logits = networks.classifier(networks.encoder(images))
+        with full_precision(device):
+            logits = networks.classifier(networks.encoder(images))
         if not torch.isfinite(logits).all().item():
             raise FloatingPointError(f"{description} model produced non-finite logits.")
         predictions = logits.argmax(dim=1)

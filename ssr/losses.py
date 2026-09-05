@@ -7,15 +7,30 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from setting.precision import full_precision
+
+
+def _loss_precision(tensor: Tensor) -> Tensor:
+    # BF16/FP16 누적만 FP32로 승격; FP64 검증 경로 유지
+    return tensor.float() if tensor.dtype in {torch.float16, torch.bfloat16} else tensor
+
 
 def negative_cosine_similarity(prediction: Tensor, projection: Tensor) -> Tensor:
     """projection branch의 gradient를 차단한 공식 SSR consistency loss."""
-    return -F.cosine_similarity(prediction, projection.detach(), dim=-1).mean()
+    with full_precision(prediction.device):
+        return -F.cosine_similarity(
+            _loss_precision(prediction),
+            _loss_precision(projection.detach()),
+            dim=-1,
+        ).mean()
 
 
 def soft_cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     """hard one-hot과 soft structural target을 모두 받는 cross-entropy."""
-    return -(F.log_softmax(logits, dim=1) * targets).sum(dim=1).mean()
+    with full_precision(logits.device):
+        return -(
+            F.log_softmax(_loss_precision(logits), dim=1) * _loss_precision(targets)
+        ).sum(dim=1).mean()
 
 
 def mixup_soft_target_views(

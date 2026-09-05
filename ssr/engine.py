@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from math import cos, pi
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,7 @@ from log.common import JsonlWriter, write_config
 from setting.config import ExperimentConfig
 from setting.data import ExperimentData, build_experiment_data
 from setting.model import SSRNetworks, build_ssr_networks, calibrate_batch_norm
+from setting.precision import PrecisionPolicy, full_precision
 from ssr.evaluation import evaluate_epoch, predict_training_labels, selection_metrics
 from ssr.sampler import ClassBalancedSampler
 from ssr.selection import SelectionResult
@@ -42,23 +44,52 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+
+def configure_execution(
+    config: ExperimentConfig, networks: SSRNetworks, device: torch.device,
+) -> None:
+    """Enable CUDA training optimizations without reducing selection precision."""
+    policy = PrecisionPolicy.from_config(config.training, device)
+    if device.type != "cuda":
+        return
+    torch.backends.cudnn.deterministic = config.runtime.deterministic
+    torch.backends.cudnn.benchmark = not config.runtime.deterministic
+    # BF16 is scoped to training. k-NN/threshold decisions stay FP32, not TF32.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if policy.channels_last:
+        networks.encoder.to(memory_format=torch.channels_last)
+
+
+def _timestamp(device: torch.device) -> float:
+    # Only synchronize at phase boundaries, never for each timed training step.
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return perf_counter()
 
 
 def _loader_options(
     config: ExperimentConfig,
     device: torch.device,
+    *,
+    evaluation: bool = False,
 ) -> dict[str, Any]:
+    workers = (
+        config.training.eval_num_workers if evaluation else config.training.num_workers
+    )
     options: dict[str, Any] = {
-        "batch_size": config.training.batch_size,
-        "num_workers": config.training.num_workers,
+        "batch_size": (
+            config.training.eval_batch_size if evaluation else config.training.batch_size
+        ),
+        "num_workers": workers,
         "pin_memory": device.type == "cuda",
     }
-    if config.training.num_workers > 0:
+    if workers > 0:
         options.update(
             prefetch_factor=config.training.prefetch_factor,
-            persistent_workers=config.training.persistent_workers,
+            # Do not keep evaluation worker pools resident during training.
+            persistent_workers=config.training.persistent_workers and not evaluation,
         )
     return options
 
@@ -69,8 +100,9 @@ def _build_epoch_loaders(
     device: torch.device,
 ) -> EpochLoaders:
     options = _loader_options(config, device)
+    eval_options = _loader_options(config, device, evaluation=True)
     return EpochLoaders(
-        evaluation=DataLoader(data.evaluation_train, shuffle=False, **options),
+        evaluation=DataLoader(data.evaluation_train, shuffle=False, **eval_options),
         all_samples=DataLoader(
             data.all_train,
             shuffle=True,
@@ -78,11 +110,11 @@ def _build_epoch_loaders(
             **options,
         ),
         validation=(
-            DataLoader(data.validation, shuffle=False, **options)
+            DataLoader(data.validation, shuffle=False, **eval_options)
             if data.validation is not None else None
         ),
         test=(
-            DataLoader(data.test, shuffle=False, **options)
+            DataLoader(data.test, shuffle=False, **eval_options)
             if data.test is not None else None
         ),
     )
@@ -147,10 +179,16 @@ def _build_optimizer(
         {"params": networks.predictor.parameters()},
     ]
     if config.training.optimizer == "adamw":
+        use_fused = config.training.fused_optimizer and all(
+            parameter.is_cuda
+            for module in networks.all_modules()
+            for parameter in module.parameters()
+        )
         return AdamW(
             parameter_groups,
             lr=config.training.learning_rate,
             weight_decay=config.training.weight_decay,
+            fused=True if use_fused else None,
         )
     return SGD(
         parameter_groups,
@@ -211,6 +249,7 @@ def run(config: ExperimentConfig) -> float | None:
     write_config(config, config.run_dir)
     device = config.resolve_device()
     seed_everything(config.seed)
+    precision = PrecisionPolicy.from_config(config.training, device)
 
     data = build_experiment_data(
         config.data,
@@ -240,21 +279,30 @@ def run(config: ExperimentConfig) -> float | None:
     loaders = _build_epoch_loaders(data, config, device)
     noisy_labels = data.noisy_labels.to(device)
     networks = build_ssr_networks(config.model, device, data.num_classes)
+    configure_execution(config, networks, device)
     if (
         config.model.calibrate_initial_batch_norm
         and not config.model.pretrained
     ):
-        calibration_batches = calibrate_batch_norm(
-            _build_calibration_loader(data, config, device),
-            networks.encoder,
-            device,
-        )
+        with full_precision(device):
+            calibration_batches = calibrate_batch_norm(
+                _build_calibration_loader(data, config, device),
+                networks.encoder,
+                device,
+            )
         print(f"initial_batch_norm_calibration_batches={calibration_batches}")
     optimizer = _build_optimizer(networks, config)
     checkpoints = CheckpointManager(config.run_dir, networks, optimizer, config)
     scheduler = _build_scheduler(optimizer, config)
 
     print(f"device={device} run={config.run_name}")
+    print(
+        f"train_precision={'bf16' if precision.amp else 'fp32'} "
+        f"selection_precision=fp32 channels_last={precision.channels_last} "
+        f"fused_adamw={bool(optimizer.defaults.get('fused', False))} "
+        f"batch={config.training.batch_size} eval_batch={config.training.eval_batch_size} "
+        f"workers={config.training.num_workers} eval_workers={config.training.eval_num_workers}"
+    )
     if loaders.validation is None:
         print("validation=disabled; best.pt omitted; last.pt saved every epoch.")
     best_accuracy: float | None = None
@@ -274,6 +322,9 @@ def run(config: ExperimentConfig) -> float | None:
         if label_wave is not None:
             stack.enter_context(label_wave)
         for epoch in range(config.training.epochs):
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            selection_started = _timestamp(device)
             supervision = evaluate_epoch(
                 loaders.evaluation,
                 networks,
@@ -281,6 +332,7 @@ def run(config: ExperimentConfig) -> float | None:
                 config,
                 device,
             )
+            selection_seconds = _timestamp(device) - selection_started
             if label_wave is not None:
                 observation = label_wave.observe(
                     supervision.predictions,
@@ -291,6 +343,7 @@ def run(config: ExperimentConfig) -> float | None:
                     stopped_by_label_wave = True
                     break
 
+            training_started = _timestamp(device)
             selected_loader = _build_selected_loader(
                 data,
                 supervision.selection,
@@ -310,15 +363,23 @@ def run(config: ExperimentConfig) -> float | None:
                 device,
                 epoch,
             )
+            training_seconds = _timestamp(device) - training_started
+            train_steps = len(loaders.all_samples)
+            samples_per_second = (
+                train_steps * config.training.batch_size / max(training_seconds, 1e-9)
+            )
             scheduler.step()
             last_completed_epoch = epoch
             current_accuracy = None
+            validation_started = _timestamp(device)
             try:
                 if loaders.validation is not None:
                     current_accuracy = test_accuracy(
-                        loaders.validation, networks, device, description="Validation"
+                        loaders.validation, networks, device, description="Validation",
+                        channels_last=config.training.channels_last,
                     )
             finally:
+                validation_seconds = _timestamp(device) - validation_started
                 # A validation error must not discard the just-trained model.
                 # Save once per completed epoch, even when evaluation fails.
                 checkpoints.save(
@@ -341,6 +402,19 @@ def run(config: ExperimentConfig) -> float | None:
                 "validation_accuracy": current_accuracy,
                 "best_validation_accuracy": best_accuracy,
                 "best_accuracy": best_accuracy,
+                "selection_seconds": selection_seconds,
+                "training_seconds": training_seconds,
+                "validation_seconds": validation_seconds,
+                "train_steps": train_steps,
+                "train_samples_per_second": samples_per_second,
+                "cuda_peak_allocated_gib": (
+                    torch.cuda.max_memory_allocated(device) / 1024**3
+                    if device.type == "cuda" else None
+                ),
+                "cuda_peak_reserved_gib": (
+                    torch.cuda.max_memory_reserved(device) / 1024**3
+                    if device.type == "cuda" else None
+                ),
                 **selection_metrics(
                     supervision.selection,
                     noisy_labels,
@@ -358,7 +432,9 @@ def run(config: ExperimentConfig) -> float | None:
                 f"selected={values['selected']} "
                 f"relabel_candidates={values['relabel_candidates']} "
                 f"label_changes={values['label_changes']} "
-                f"{accuracy_summary}"
+                f"{accuracy_summary} "
+                f"selection_s={selection_seconds:.1f} train_s={training_seconds:.1f} "
+                f"train_samples/s={samples_per_second:.1f}"
             )
 
             if is_best:
@@ -373,6 +449,7 @@ def run(config: ExperimentConfig) -> float | None:
                 loaders.evaluation,
                 networks,
                 device,
+                channels_last=config.training.channels_last,
             )
             label_wave.observe(
                 final_predictions,
@@ -381,7 +458,10 @@ def run(config: ExperimentConfig) -> float | None:
             )
 
     if loaders.test is not None:
-        final_test_accuracy = test_accuracy(loaders.test, networks, device, description="Test")
+        final_test_accuracy = test_accuracy(
+            loaders.test, networks, device, description="Test",
+            channels_last=config.training.channels_last,
+        )
         print(f"final_test_accuracy={final_test_accuracy:.4f} (last checkpoint)")
         checkpoints.save(
             "last.pt",

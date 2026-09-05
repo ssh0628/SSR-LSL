@@ -13,6 +13,7 @@ from tqdm import tqdm
 from lsl import extract_structural_labels
 from setting.config import ExperimentConfig
 from setting.model import SSRNetworks
+from setting.precision import full_precision
 from ssr.selection import SelectionResult, select_samples
 
 
@@ -47,11 +48,23 @@ def _validate_model_outputs(features: Tensor, logits: Tensor) -> None:
         raise FloatingPointError("Model produced non-finite features or logits during evaluation.")
 
 
+def _evaluation_images(images: Tensor, device: torch.device, channels_last: bool) -> Tensor:
+    # AMP is limited to training; preserve double precision in diagnostic tests.
+    dtype = torch.float32 if images.dtype in (torch.float16, torch.bfloat16) else images.dtype
+    if channels_last and device.type == "cuda" and images.ndim == 4:
+        return images.to(
+            device, dtype=dtype, non_blocking=True, memory_format=torch.channels_last
+        )
+    return images.to(device, dtype=dtype, non_blocking=True)
+
+
 @torch.no_grad()
 def _extract_features_and_predictions(
     loader: DataLoader,
     networks: SSRNetworks,
     device: torch.device,
+    *,
+    channels_last: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Extract directly into dataset-order buffers to avoid a second full copy."""
 
@@ -61,21 +74,22 @@ def _extract_features_and_predictions(
     probabilities_all: Tensor | None = None
     seen = torch.zeros(sample_count, dtype=torch.bool)
 
-    for images, indices in tqdm(loader, desc="Feature extraction", leave=False):
-        cpu_indices = _record_indices(indices, images.size(0), seen)
-        images = images.to(device, non_blocking=True)
-        features = networks.encoder(images)
-        logits = networks.classifier(features)
-        _validate_model_outputs(features, logits)
-        probabilities = torch.softmax(logits, dim=1)
-        device_indices = cpu_indices.to(device, non_blocking=True)
-        if features_all is None:
-            features_all = features.new_empty((sample_count, features.size(1)))
-            probabilities_all = probabilities.new_empty(
-                (sample_count, probabilities.size(1))
-            )
-        features_all.index_copy_(0, device_indices, features)
-        probabilities_all.index_copy_(0, device_indices, probabilities)
+    with full_precision(device):
+        for images, indices in tqdm(loader, desc="Feature extraction", leave=False):
+            cpu_indices = _record_indices(indices, images.size(0), seen)
+            images = _evaluation_images(images, device, channels_last)
+            features = networks.encoder(images)
+            logits = networks.classifier(features)
+            _validate_model_outputs(features, logits)
+            probabilities = torch.softmax(logits, dim=1)
+            device_indices = cpu_indices.to(device, non_blocking=True)
+            if features_all is None:
+                features_all = features.new_empty((sample_count, features.size(1)))
+                probabilities_all = probabilities.new_empty(
+                    (sample_count, probabilities.size(1))
+                )
+            features_all.index_copy_(0, device_indices, features)
+            probabilities_all.index_copy_(0, device_indices, probabilities)
 
     if features_all is None or probabilities_all is None:
         raise RuntimeError("Evaluation loader must contain at least one batch.")
@@ -93,31 +107,34 @@ def evaluate_epoch(
     device: torch.device,
 ) -> EpochSupervision:
     """논문 Algorithm 2의 relabel -> select -> structural-label 순서."""
-    raw_features, probabilities = _extract_features_and_predictions(
-        loader,
-        networks,
-        device,
-    )
-    selection = select_samples(
-        raw_features,
-        noisy_labels,
-        probabilities,
-        relabel_threshold=config.ssr.relabel_threshold,
-        selection_threshold=config.ssr.selection_threshold,
-        neighbors=config.ssr.neighbors,
-        chunks=config.ssr.knn_chunks,
-        num_classes=config.data.num_classes,
-    )
-    structural_targets = None
-    if config.structural_labels.enabled:
-        structural_targets = extract_structural_labels(
+    # k-NN rankings and confidence thresholds must not inherit a caller's AMP.
+    with full_precision(device):
+        raw_features, probabilities = _extract_features_and_predictions(
+            loader,
+            networks,
+            device,
+            channels_last=getattr(getattr(config, "training", None), "channels_last", False),
+        )
+        selection = select_samples(
             raw_features,
-            selection.modified_labels,
-            neighbors=config.structural_labels.neighbors,
-            chunks=config.structural_labels.knn_chunks,
+            noisy_labels,
+            probabilities,
+            relabel_threshold=config.ssr.relabel_threshold,
+            selection_threshold=config.ssr.selection_threshold,
+            neighbors=config.ssr.neighbors,
+            chunks=config.ssr.knn_chunks,
             num_classes=config.data.num_classes,
         )
-    predictions = probabilities.argmax(dim=1)
+        structural_targets = None
+        if config.structural_labels.enabled:
+            structural_targets = extract_structural_labels(
+                raw_features,
+                selection.modified_labels,
+                neighbors=config.structural_labels.neighbors,
+                chunks=config.structural_labels.knn_chunks,
+                num_classes=config.data.num_classes,
+            )
+        predictions = probabilities.argmax(dim=1)
     return EpochSupervision(selection, structural_targets, predictions)
 
 
@@ -126,20 +143,23 @@ def predict_training_labels(
     loader: DataLoader,
     networks: SSRNetworks,
     device: torch.device,
+    *,
+    channels_last: bool = False,
 ) -> Tensor:
     """Return raw model predictions in the evaluation dataset's fixed order."""
     networks.eval()
     sample_count = len(loader.dataset)
     predictions = torch.empty(sample_count, dtype=torch.long)
     seen = torch.zeros(sample_count, dtype=torch.bool)
-    for images, indices in tqdm(loader, desc="Prediction extraction", leave=False):
-        cpu_indices = _record_indices(indices, images.size(0), seen)
-        images = images.to(device, non_blocking=True)
-        features = networks.encoder(images)
-        logits = networks.classifier(features)
-        _validate_model_outputs(features, logits)
-        batch_predictions = logits.argmax(dim=1).cpu()
-        predictions.index_copy_(0, cpu_indices, batch_predictions)
+    with full_precision(device):
+        for images, indices in tqdm(loader, desc="Prediction extraction", leave=False):
+            cpu_indices = _record_indices(indices, images.size(0), seen)
+            images = _evaluation_images(images, device, channels_last)
+            features = networks.encoder(images)
+            logits = networks.classifier(features)
+            _validate_model_outputs(features, logits)
+            batch_predictions = logits.argmax(dim=1).cpu()
+            predictions.index_copy_(0, cpu_indices, batch_predictions)
     if not seen.any():
         raise RuntimeError("Prediction loader must contain at least one batch.")
     if not seen.all():

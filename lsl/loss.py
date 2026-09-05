@@ -24,4 +24,5 @@ def structural_mixup_loss(
         alpha=mixup_alpha,
     )
     logits = classifier(encoder(mixed_inputs))
+    # Encoder/classifier는 호출부 AMP 적용; CE 누적은 FP32 유지
     return soft_cross_entropy(logits, mixed_targets)
