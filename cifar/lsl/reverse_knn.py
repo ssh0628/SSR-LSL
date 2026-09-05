@@ -6,7 +6,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ssr.knn import similarity_chunk_size
+
+def _chunk_bounds(size: int, chunks: int) -> list[tuple[int, int]]:
+    """빈 chunk 없이 전체 [0, size)를 순서대로 분할."""
+    chunk_size = (size + chunks - 1) // chunks
+    return [
+        (start, min(start + chunk_size, size))
+        for start in range(0, size, chunk_size)
+    ]
 
 
 @torch.no_grad()
@@ -47,20 +54,13 @@ def extract_structural_labels(
     )
     flat_edge_counts = edge_counts.view(-1)
 
-    sample_count = features.size(0)
-    chunk_size = similarity_chunk_size(
-        sample_count, sample_count, normalized_features.element_size(), chunks
-    )
-    for start in range(0, sample_count, chunk_size):
-        end = min(start + chunk_size, sample_count)
+    for start, end in _chunk_bounds(features.size(0), chunks):
         similarity = torch.mm(normalized_features[start:end], feature_bank)
         local_rows = torch.arange(end - start, device=features.device)
         # Self is a valid nearest neighbor in Algorithm 1. Pinning it to the
         # maximum also guarantees every sample receives at least one label.
         similarity[local_rows, local_rows + start] = torch.inf
         neighbor_indices = similarity.topk(k=neighbors, dim=1).indices
-        # Release this chunk before allocating the next query-bank matrix.
-        del similarity
         source_labels = relabelled_labels[start:end, None].expand(-1, neighbors)
         flat_targets = (
             neighbor_indices.reshape(-1) * num_classes + source_labels.reshape(-1)

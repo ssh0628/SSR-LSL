@@ -1,103 +1,171 @@
-"""CIFAR-10 SSR/LSL 실험의 단일 설정 소스."""
+"""General image-dataset configuration; CIFAR experiments live in cifar/."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
 import torch
 
-# PROJECT_ROOT = Path("/workspace/SSR-LSL").expanduser().resolve()
+# - 프로젝트 루트: 아래 상수에서 직접 지정 가능
+# PROJECT_ROOT = Path("/root/project/ssr").expanduser().resolve()
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# 논문 기본값(batch=128, lr=0.02, chunk=10)
-# RTX 5080 (16 GB):
-#   batch_size=256, num_workers=8, prefetch_factor=4,
-#   SSR/LSL knn_chunks=8
-# H100 NVL (94 GB):
-#   batch_size=512, num_workers=16, prefetch_factor=4,
-#   SSR/LSL knn_chunks=2
+# - ConvNeXtV2-Tiny / 224px 기준 GPU 시작값
+# - RTX 5080 16 GB: batch_size=16, num_workers=8
+# - H100 NVL 94 GB: batch_size=64, num_workers=16
+# - LR: GPU에 따른 자동 변경 없음
+OptimizerName = Literal["sgd", "adamw"]
 
-NoiseKind = Literal["symmetric", "asymmetric", "idn"]
-ModelName = Literal["preact_resnet18", "cifar_resnet18", "cifar_resnet34"]
+
+@dataclass(frozen=True, slots=True)
+class SplitConfig:
+    """root 기준 NPY 파일명. 절대 경로도 사용 가능."""
+
+    paths: str  # 이미지 경로 NPY
+    labels: str  # 정수 class index NPY
+
+    def validate(self) -> None:
+        if not self.paths.strip() or not self.labels.strip():
+            raise ValueError("Split paths/labels filenames must not be empty.")
 
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    """CIFAR-10 데이터와 합성 노이즈 설정."""
+    """사용자가 준비한 이미지 경로/라벨 NPY. 추가 noise나 sqrt sampling 없음."""
 
-    root: Path = field(default_factory=lambda: PROJECT_ROOT / "data")  # CIFAR-10 저장 경로.
-    download: bool = True  # 데이터가 없을 때 torchvision으로 내려받을지 여부.
-    noise_kind: NoiseKind = "idn"  # "idn", "symmetric", "asymmetric" 중 하나.
-    noise_rate: float = 0.5  # 목표 합성 노이즈 비율. 논문 IDN 범위는 0.20~0.50.
-    idn_flip_rate_std: float = 0.1  # Xia et al. IDN truncated-normal 표준편차.
+    root: Path = Path("/root/project/dataset/npy_path/modify_npy")  # NPY 저장 위치
+    image_root: Path | None = None  # 상대 이미지 경로 기준; None: root
+    name: str = "a1-a7"  # 결과 폴더용 데이터셋 이름
+    class_names: tuple[str, ...] = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")  # label 순서
+    train: SplitConfig = field(
+        default_factory=lambda: SplitConfig("train_path.npy", "train_labels.npy")
+    )
+    validation: SplitConfig | None = field(
+        default_factory=lambda: SplitConfig("val_path.npy", "val_labels.npy")
+    )  # None: validation 및 best.pt 생략
+    test: SplitConfig | None = field(
+        default_factory=lambda: SplitConfig("test_path.npy", "test_labels.npy")
+    )  # None: 최종 test 평가 생략
+    label_offset: int = 0  # 라벨 시작 번호: 0 또는 1
+    image_size: int = 224  # 전체 이미지 resize 크기; ROI/cache 미사용
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # RGB 평균
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # RGB 표준편차
+    allow_truncated_images: bool = True  # 잘린 이미지 decoder 재시도
+    verify_images: bool = True  # 모델 생성 전 전체 이미지 decode 검사
+    image_check_workers: int = 8  # 사전 검사 worker 수
 
-    def noise_file(self, seed: int) -> Path:
-        """현재 noise 설정과 전역 seed에 대응하는 재사용 artifact 경로."""
-        rate = f"{self.noise_rate:.4f}".rstrip("0").rstrip(".")
-        standard_deviation = (
-            f"_std{self.idn_flip_rate_std:g}" if self.noise_kind == "idn" else ""
-        )
-        filename = (
-            f"cifar10_{self.noise_kind}_{rate}{standard_deviation}_seed{seed}.pt"
-        )
-        return self.root / "noise" / filename
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
 
     def validate(self) -> None:
         if not self.root.is_absolute():
             raise ValueError("data.root must be an absolute path.")
-        if self.noise_kind not in {"symmetric", "asymmetric", "idn"}:
-            raise ValueError("data.noise_kind must be symmetric, asymmetric, or idn.")
-        if not 0.0 <= self.noise_rate < 1.0:
-            raise ValueError("data.noise_rate must be in [0, 1).")
-        if self.idn_flip_rate_std <= 0.0:
-            raise ValueError("data.idn_flip_rate_std must be positive.")
+        if not isinstance(self.train, SplitConfig):
+            raise ValueError("data.train must specify paths and labels files.")
+        if self.image_root is not None and not self.image_root.is_absolute():
+            raise ValueError("data.image_root must be an absolute path.")
+        if (
+            not self.name
+            or not self.name.isascii()
+            or not self.name.replace("-", "").replace("_", "").isalnum()
+        ):
+            raise ValueError("data.name must contain only letters, digits, '-' or '_'.")
+        if len(self.class_names) < 2 or len(set(self.class_names)) != len(self.class_names):
+            raise ValueError("data.class_names must contain at least two unique names.")
+        if any(not isinstance(name, str) or not name.strip() for name in self.class_names):
+            raise ValueError("data.class_names must be non-empty strings.")
+        for split in (self.train, self.validation, self.test):
+            if split is not None:
+                split.validate()
+        if self.image_size < 1:
+            raise ValueError("data.image_size must be positive.")
+        if not isinstance(self.label_offset, int):
+            raise ValueError("data.label_offset must be an integer.")
+        if (
+            len(self.mean) != 3
+            or len(self.std) != 3
+            or not all(isfinite(v) for v in (*self.mean, *self.std))
+            or any(v <= 0 for v in self.std)
+        ):
+            raise ValueError("data.mean/std must have three finite channels and positive std.")
+        if self.image_check_workers < 1:
+            raise ValueError("data.image_check_workers must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class AugmentationConfig:
+    """도메인에 맞춰 조절하는 증강. 평가 입력에는 적용하지 않는다."""
+
+    horizontal_flip: float = 0.5  # 좌우 반전 확률
+    vertical_flip: float = 0.5  # 상하 반전 확률; 방향 중요 시 0
+    weak_rotation: float = 10.0  # weak view 회전 범위 ±degree
+    strong_rotation: float = 15.0  # strong view 회전 범위 ±degree
+    color_jitter: tuple[float, float, float, float] = (0.1, 0.1, 0.05, 0.02)  # 밝기/대비/채도/색상
+
+    def validate(self) -> None:
+        if not 0 <= self.horizontal_flip <= 1 or not 0 <= self.vertical_flip <= 1:
+            raise ValueError("augmentation flip probabilities must be in [0, 1].")
+        if any(not isfinite(v) or v < 0 for v in (self.weak_rotation, self.strong_rotation)):
+            raise ValueError("augmentation rotation must be finite and non-negative.")
+        if (
+            len(self.color_jitter) != 4
+            or any(not isfinite(v) or v < 0 for v in self.color_jitter)
+            or self.color_jitter[3] > 0.5
+        ):
+            raise ValueError("Invalid color_jitter; hue must be in [0, 0.5].")
 
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """분류 backbone 설정."""
+    """timm backbone 이름. pretrained encoder + 새 SSR heads."""
 
-    name: ModelName = "preact_resnet18"  # 논문 backbone 또는 RLNLC의 CIFAR ResNet-18/34.
+    name: str = "convnextv2_tiny"  # timm 모델명; resnet18 / resnet34 등
+    pretrained: bool = True  # pretrained weight 사용 여부
+    drop_path_rate: float = 0.2  # stochastic-depth 비율
+    calibrate_initial_batch_norm: bool = True  # scratch encoder BN 통계 초기 보정
 
     def validate(self) -> None:
-        if self.name not in {
-            "preact_resnet18",
-            "cifar_resnet18",
-            "cifar_resnet34",
-        }:
-            raise ValueError("Unsupported model.name.")
+        if not self.name.strip():
+            raise ValueError("model.name must not be empty.")
+        if not 0 <= self.drop_path_rate < 1:
+            raise ValueError("model.drop_path_rate must be in [0, 1).")
 
 
 @dataclass(frozen=True, slots=True)
 class SSRConfig:
-    """공식 CIFAR SSR 구현에서 유지한 설정."""
+    """SSR relabel, sample selection과 loss 설정."""
 
-    # 예측 label로 바꾸기 위한 strict confidence 하한 tau_r.
-    relabel_threshold: float = 0.55
-    # k-NN consistency 선택 하한 tau_s; 1이면 최다 vote와 일치.
+    # - relabel 조건: confidence > tau_r
+    relabel_threshold: float = 0.9
+    # - selection 기준: tau_s=1이면 최다 k-NN vote와 일치
     selection_threshold: float = 1.0
-    neighbors: int = 200  # SSR sample selection에 사용하는 cosine k-NN의 K.
-    # 결과에 영향 없이 SSR k-NN query를 나누는 메모리 chunk 수.
+    neighbors: int = 200  # SSR cosine k-NN 이웃 수
+    # - SSR k-NN query 분할 수; 메모리 조절용
     knn_chunks: int = 10
-    feature_consistency_weight: float = 1.0  # feature-consistency loss 가중치 lambda_fc.
-    mixup_alpha: float = 4.0  # CIFAR 실험의 Beta(alpha, alpha) mixup 파라미터.
+    feature_consistency_weight: float = 1.0  # feature-consistency loss 가중치
+    mixup_alpha: float = 4.0  # mixup Beta(alpha, alpha)
 
     def validate(self) -> None:
         if not 0.0 <= self.relabel_threshold <= 1.0:
             raise ValueError("ssr.relabel_threshold must be in [0, 1].")
         if not 0.0 <= self.selection_threshold <= 1.0:
             raise ValueError("ssr.selection_threshold must be in [0, 1].")
-        if not 1 <= self.neighbors <= 50_000:
-            raise ValueError("ssr.neighbors must be in [1, 50000].")
+        if self.neighbors < 1:
+            raise ValueError("ssr.neighbors must be positive.")
         if self.knn_chunks < 1:
             raise ValueError("ssr.knn_chunks must be positive.")
-        if self.feature_consistency_weight < 0.0:
+        if (
+            not isfinite(self.feature_consistency_weight)
+            or self.feature_consistency_weight < 0.0
+        ):
             raise ValueError("ssr.feature_consistency_weight must not be negative.")
-        if self.mixup_alpha <= 0.0:
+        if not isfinite(self.mixup_alpha) or self.mixup_alpha <= 0.0:
             raise ValueError("ssr.mixup_alpha must be positive.")
 
 
@@ -105,18 +173,18 @@ class SSRConfig:
 class StructuralLabelsConfig:
     """CVPR 2024 Learning with Structural Labels 설정."""
 
-    enabled: bool = True  # True면 reverse k-NN structural target과 L_st를 SSR에 추가.
-    neighbors: int = 20  # reverse k-NN에서 각 source가 label을 전파할 이웃 수 k_st.
-    # 결과에 영향 없이 reverse k-NN query를 나누는 메모리 chunk 수.
+    enabled: bool = True  # LSL structural target/loss 활성화
+    neighbors: int = 20  # reverse k-NN label 전파 이웃 수
+    # - reverse k-NN query 분할 수; 메모리 조절용
     knn_chunks: int = 10
-    loss_weight: float = 1.0  # structural-label mixup cross-entropy 가중치 lambda_st.
+    loss_weight: float = 1.0  # structural mixup CE 가중치
 
     def validate(self) -> None:
-        if not 1 <= self.neighbors <= 50_000:
-            raise ValueError("structural_labels.neighbors must be in [1, 50000].")
+        if self.neighbors < 1:
+            raise ValueError("structural_labels.neighbors must be positive.")
         if self.knn_chunks < 1:
             raise ValueError("structural_labels.knn_chunks must be positive.")
-        if self.loss_weight < 0.0:
+        if not isfinite(self.loss_weight) or self.loss_weight < 0.0:
             raise ValueError("structural_labels.loss_weight must not be negative.")
         if self.enabled and self.loss_weight == 0.0:
             raise ValueError(
@@ -128,13 +196,15 @@ class StructuralLabelsConfig:
 class LabelWaveConfig:
     """ICLR 2024 Label Wave checkpoint 선택 설정."""
 
-    enabled: bool = True  # True면 training prediction change를 추적하고 label_wave.pt 저장.
-    # False면 전체 epoch를 유지하며 선택 지점만 관찰; 검증 후 True로 바꿔 실제 조기 종료.
+    enabled: bool = True  # prediction change 추적 + label_wave.pt 저장
+    # - False: checkpoint 저장 + 전체 epoch 학습
+    # - True: checkpoint 저장 + 조기 종료
     stop_training: bool = False
-    # 최근 k개 prediction-change의 이동평균. 논문 Appendix E에서 k=3 상관이 가장 강함.
+    # - prediction-change 이동평균 window
+    # - 시작값 3: 논문 Appendix E 참고
     moving_average_window: int = 3
-    # 논문은 patience 동작만 정의하고 고정 기본값은 공개하지 않아 실험값으로 노출.
-    patience: int = 10
+    # - patience: 개선 없는 연속 횟수; 실험 설정값
+    patience: int = 20
 
     def validate(self, training_epochs: int) -> None:
         if self.moving_average_window < 1:
@@ -153,29 +223,46 @@ class LabelWaveConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
-    """논문의 CIFAR 최적화 설정."""
+    """일반 이미지 데이터셋 학습 설정."""
 
-    epochs: int = 300  # scratch 학습 epoch 수; 별도 warm-up은 없음.
-    batch_size: int = 128  # selected/all/test DataLoader의 mini-batch 크기.
-    learning_rate: float = 0.02  # SGD 초기 learning rate.
-    momentum: float = 0.9  # SGD momentum.
-    weight_decay: float = 5e-4  # SGD L2 weight decay.
-    scheduler_eta_min_ratio: float = 1.0 / 50.0  # cosine scheduler 최저 LR / 초기 LR.
-    num_workers: int = 4  # 각 DataLoader의 worker process 수.
-    # worker마다 미리 준비할 batch 수; num_workers=0이면 미사용.
+    epochs: int = 200  # 학습 epoch 수; 별도 warm-up 없음
+    batch_size: int = 64  # DataLoader mini-batch 크기
+    learning_rate: float = 1e-3  # classifier/projector/predictor 초기 LR
+    # - encoder 전용 초기 LR
+    # - None: head와 같은 learning_rate
+    encoder_learning_rate: float | None = 3e-5
+    optimizer: OptimizerName = "adamw"  # adamw / sgd
+    momentum: float = 0.9  # SGD momentum
+    weight_decay: float = 0.1  # weight decay
+    # - cosine 최저 LR / 각 parameter group 초기 LR
+    scheduler_eta_min_ratio: float = 1e-3
+    num_workers: int = 16  # DataLoader worker 수
+    # - worker당 미리 준비할 batch 수; workers=0이면 미사용
     prefetch_factor: int = 2
-    # epoch 사이 worker를 유지해 재시작 비용을 줄일지 여부.
+    # - epoch 간 worker 유지; selected loader는 매 epoch 재생성
     persistent_workers: bool = True
 
     def validate(self) -> None:
-        if self.epochs < 1 or self.batch_size < 1:
-            raise ValueError("training epochs and batch_size must be positive.")
-        if self.learning_rate <= 0.0:
+        if self.epochs < 1:
+            raise ValueError("training.epochs must be positive.")
+        if self.batch_size < 2:
+            raise ValueError(
+                "training.batch_size must be at least 2 for the SSR BatchNorm heads."
+            )
+        if not isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("training.learning_rate must be positive.")
-        if self.momentum < 0.0 or self.weight_decay < 0.0:
-            raise ValueError("training momentum and weight_decay must not be negative.")
-        if self.scheduler_eta_min_ratio < 0.0:
-            raise ValueError("training.scheduler_eta_min_ratio must not be negative.")
+        if self.encoder_learning_rate is not None and (
+            not isfinite(self.encoder_learning_rate) or self.encoder_learning_rate <= 0.0
+        ):
+            raise ValueError("training.encoder_learning_rate must be positive when set.")
+        if self.optimizer not in {"sgd", "adamw"}:
+            raise ValueError("training.optimizer must be sgd or adamw.")
+        if not 0.0 <= self.momentum < 1.0:
+            raise ValueError("training.momentum must be in [0, 1).")
+        if not isfinite(self.weight_decay) or self.weight_decay < 0.0:
+            raise ValueError("training.weight_decay must not be negative.")
+        if not 0.0 <= self.scheduler_eta_min_ratio <= 1.0:
+            raise ValueError("training.scheduler_eta_min_ratio must be in [0, 1].")
         if self.num_workers < 0:
             raise ValueError("training.num_workers must not be negative.")
         if self.prefetch_factor < 1:
@@ -184,74 +271,61 @@ class TrainingConfig:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
-    """알고리즘 결과를 바꾸지 않는 실행·출력 설정."""
+    """실행·저장 설정."""
 
-    device: str = "auto"  # "auto", "cuda", "mps", "cpu" 또는 torch device 문자열.
-    # config, metric, checkpoint를 저장할 루트.
-    output_root: Path = field(default_factory=lambda: PROJECT_ROOT / "outputs")
+    device: str = "auto"  # auto: CUDA → MPS → CPU
+    output_root: Path = field(default_factory=lambda: PROJECT_ROOT / "outputs")  # 결과 저장 루트
+    run_id: str | None = None  # None: 실행 시각 ID; 중복 지정 ID 거부
 
     def validate(self) -> None:
         if not self.output_root.is_absolute():
             raise ValueError("runtime.output_root must be an absolute path.")
+        if self.run_id is not None and (
+            not self.run_id
+            or self.run_id in {".", ".."}
+            or Path(self.run_id).name != self.run_id
+            or "/" in self.run_id
+            or "\\" in self.run_id
+        ):
+            raise ValueError("runtime.run_id must be a single directory name.")
 
 
 @dataclass(frozen=True, slots=True)
 class ExperimentConfig:
-    """한 번의 CIFAR-10 실험 전체 설정."""
+    """이 설정 하나로 일반 데이터셋 실험 실행."""
 
-    seed: int = 0  # Python, NumPy, PyTorch, CUDA, noise 생성에 공통으로 쓰는 단일 seed.
-    data: DataConfig = field(default_factory=DataConfig)  # 데이터와 label-noise 설정.
-    model: ModelConfig = field(default_factory=ModelConfig)  # backbone 선택 설정.
-    ssr: SSRConfig = field(default_factory=SSRConfig)  # SSR relabel/selection/loss 설정.
-    structural_labels: StructuralLabelsConfig = field(
-        default_factory=StructuralLabelsConfig
-    )  # LSL reverse k-NN 및 structural loss 토글·설정.
-    label_wave: LabelWaveConfig = field(
-        default_factory=LabelWaveConfig
-    )  # validation GT 없는 checkpoint 선택 및 optional early stopping.
-    training: TrainingConfig = field(default_factory=TrainingConfig)  # optimizer와 epoch 설정.
+    seed: int = 0  # Python/NumPy/PyTorch 공통 seed
+    data: DataConfig = field(default_factory=DataConfig)
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    ssr: SSRConfig = field(default_factory=SSRConfig)
+    structural_labels: StructuralLabelsConfig = field(default_factory=StructuralLabelsConfig)
+    label_wave: LabelWaveConfig = field(default_factory=LabelWaveConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @property
     def run_name(self) -> str:
-        """읽기 쉬운 prefix와 전체 설정 hash로 충돌을 막은 실행 이름."""
-        rate = f"{self.data.noise_rate:.4f}".rstrip("0").rstrip(".")
-        algorithm = (
-            f"lsl-k{self.structural_labels.neighbors}"
-            if self.structural_labels.enabled
-            else "ssr"
-        )
+        algorithm = "ssr-lsl" if self.structural_labels.enabled else "ssr"
         if self.label_wave.enabled:
-            mode = "stop" if self.label_wave.stop_training else "monitor"
-            algorithm += (
-                f"-lw-{mode}-k{self.label_wave.moving_average_window}"
-                f"-p{self.label_wave.patience}"
-            )
+            algorithm += "-lw-stop" if self.label_wave.stop_training else "-lw-save"
         signature = asdict(self)
         signature["runtime"].pop("output_root")
-        encoded = json.dumps(
-            signature,
-            sort_keys=True,
-            default=str,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        signature["runtime"].pop("run_id")
+        encoded = json.dumps(signature, sort_keys=True, default=str).encode("utf-8")
         fingerprint = hashlib.blake2s(encoded, digest_size=4).hexdigest()
-        return (
-            f"cifar10_{self.data.noise_kind}{rate}_{self.model.name}_{algorithm}"
-            f"_tr{self.ssr.relabel_threshold:g}_ts{self.ssr.selection_threshold:g}"
-            f"_seed{self.seed}_{fingerprint}"
-        )
+        return f"{self.data.name}_{algorithm}_seed{self.seed}_{fingerprint}"
 
     @property
     def run_dir(self) -> Path:
-        """config, metric, checkpoint를 저장할 현재 실행 디렉터리."""
-        return self.runtime.output_root / self.run_name
+        directory = self.runtime.output_root / self.run_name
+        return directory / self.runtime.run_id if self.runtime.run_id else directory
 
     def validate(self) -> None:
-        """학습을 시작하기 전에 잘못된 조합을 빠르게 차단."""
         if self.seed < 0:
             raise ValueError("seed must not be negative.")
         self.data.validate()
+        self.augmentation.validate()
         self.model.validate()
         self.ssr.validate()
         self.structural_labels.validate()
@@ -260,7 +334,6 @@ class ExperimentConfig:
         self.runtime.validate()
 
     def resolve_device(self) -> torch.device:
-        """명시적 device를 존중하고 auto에서는 CUDA, MPS, CPU 순으로 선택."""
         if self.runtime.device != "auto":
             return torch.device(self.runtime.device)
         if torch.cuda.is_available():
@@ -270,6 +343,4 @@ class ExperimentConfig:
         return torch.device("cpu")
 
 
-# 이 객체만 수정하면 전체 실험이 바뀐다.
-# argparse나 숨은 전역 override는 사용하지 않는다.
 CONFIG = ExperimentConfig()

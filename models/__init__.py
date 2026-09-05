@@ -1,6 +1,5 @@
-"""CIFAR-10 backbone definitions."""
+"""General image backbone construction."""
 
-from models.cifar_resnet import CifarResNet, build_cifar_resnet
-from models.preresnet import PreResNet18
+from models.backbone import build_encoder
 
-__all__ = ["CifarResNet", "PreResNet18", "build_cifar_resnet"]
+__all__ = ["build_encoder"]

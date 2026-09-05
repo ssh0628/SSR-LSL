@@ -10,10 +10,10 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from lsl import extract_structural_labels
-from setting.config import ExperimentConfig
-from setting.model import SSRNetworks
-from ssr.selection import SelectionResult, select_samples
+from cifar.setting.config import ExperimentConfig
+from cifar.setting.model import SSRNetworks
+from cifar.ssr.selection import SelectionResult, select_samples
+from cifar.lsl import extract_structural_labels
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,28 +23,6 @@ class EpochSupervision:
     selection: SelectionResult
     structural_targets: Tensor | None
     predictions: Tensor
-
-
-def _record_indices(indices: Tensor, batch_size: int, seen: Tensor) -> Tensor:
-    """Require each dataset row exactly once, including within this batch."""
-    cpu_indices = torch.as_tensor(indices, dtype=torch.long, device="cpu")
-    if (
-        cpu_indices.ndim != 1
-        or cpu_indices.numel() == 0
-        or cpu_indices.numel() != batch_size
-        or int(cpu_indices.min()) < 0
-        or int(cpu_indices.max()) >= seen.numel()
-        or cpu_indices.unique().numel() != cpu_indices.numel()
-        or seen[cpu_indices].any()
-    ):
-        raise RuntimeError("Evaluation loader returned invalid or duplicate indices.")
-    seen[cpu_indices] = True
-    return cpu_indices
-
-
-def _validate_model_outputs(features: Tensor, logits: Tensor) -> None:
-    if not (torch.isfinite(features).all() & torch.isfinite(logits).all()).item():
-        raise FloatingPointError("Model produced non-finite features or logits during evaluation.")
 
 
 @torch.no_grad()
@@ -62,12 +40,19 @@ def _extract_features_and_predictions(
     seen = torch.zeros(sample_count, dtype=torch.bool)
 
     for images, indices in tqdm(loader, desc="Feature extraction", leave=False):
-        cpu_indices = _record_indices(indices, images.size(0), seen)
         images = images.to(device, non_blocking=True)
         features = networks.encoder(images)
         logits = networks.classifier(features)
-        _validate_model_outputs(features, logits)
         probabilities = torch.softmax(logits, dim=1)
+        cpu_indices = torch.as_tensor(indices, dtype=torch.long)
+        if (
+            cpu_indices.numel() != images.size(0)
+            or int(cpu_indices.min()) < 0
+            or int(cpu_indices.max()) >= sample_count
+            or seen[cpu_indices].any()
+        ):
+            raise RuntimeError("Evaluation loader returned invalid or duplicate indices.")
+        seen[cpu_indices] = True
         device_indices = cpu_indices.to(device, non_blocking=True)
         if features_all is None:
             features_all = features.new_empty((sample_count, features.size(1)))
@@ -133,12 +118,18 @@ def predict_training_labels(
     predictions = torch.empty(sample_count, dtype=torch.long)
     seen = torch.zeros(sample_count, dtype=torch.bool)
     for images, indices in tqdm(loader, desc="Prediction extraction", leave=False):
-        cpu_indices = _record_indices(indices, images.size(0), seen)
         images = images.to(device, non_blocking=True)
         features = networks.encoder(images)
-        logits = networks.classifier(features)
-        _validate_model_outputs(features, logits)
-        batch_predictions = logits.argmax(dim=1).cpu()
+        batch_predictions = networks.classifier(features).argmax(dim=1).cpu()
+        cpu_indices = torch.as_tensor(indices, dtype=torch.long)
+        if (
+            cpu_indices.numel() != images.size(0)
+            or int(cpu_indices.min()) < 0
+            or int(cpu_indices.max()) >= sample_count
+            or seen[cpu_indices].any()
+        ):
+            raise RuntimeError("Prediction loader returned invalid or duplicate indices.")
+        seen[cpu_indices] = True
         predictions.index_copy_(0, cpu_indices, batch_predictions)
     if not seen.any():
         raise RuntimeError("Prediction loader must contain at least one batch.")
@@ -150,10 +141,11 @@ def predict_training_labels(
 def selection_metrics(
     selection: SelectionResult,
     noisy_labels: Tensor,
+    clean_labels: Tensor | None,
     *,
-    num_classes: int,
+    num_classes: int = 10,
 ) -> dict[str, Any]:
-    """Return observed-label correction counts without assuming clean GT."""
+    """Return label-free counts and optional clean-label diagnostics."""
     selected = selection.selected_indices
     rejected = selection.rejected_indices
     modified = selection.modified_labels
@@ -174,7 +166,7 @@ def selection_metrics(
                 }
             )
 
-    return {
+    metrics: dict[str, Any] = {
         "selected": int(selected.numel()),
         "rejected": int(rejected.numel()),
         "relabel_candidates": int(relabelled.numel()),
@@ -187,3 +179,23 @@ def selection_metrics(
         "confidence_min": float(selection.confidences.min().item()),
         "confidence_max": float(selection.confidences.max().item()),
     }
+    if clean_labels is not None:
+        metrics.update(
+            tp=int(modified[selected].eq(clean_labels[selected]).sum().item()),
+            fp=int(modified[selected].ne(clean_labels[selected]).sum().item()),
+            tn=int(modified[rejected].ne(clean_labels[rejected]).sum().item()),
+            fn=int(modified[rejected].eq(clean_labels[rejected]).sum().item()),
+            relabel_correct=int(
+                modified[relabelled].eq(clean_labels[relabelled]).sum().item()
+            ),
+            relabel_original_correct=int(
+                noisy_labels[relabelled].eq(clean_labels[relabelled]).sum().item()
+            ),
+            label_change_correct=int(
+                modified[changed].eq(clean_labels[changed]).sum().item()
+            ),
+            label_change_original_correct=int(
+                noisy_labels[changed].eq(clean_labels[changed]).sum().item()
+            ),
+        )
+    return metrics

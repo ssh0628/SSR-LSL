@@ -1,290 +1,214 @@
-"""CIFAR-10-only data setup and reproducible synthetic label noise."""
+"""Provided path/label NPY datasets with stable per-image SSR indices."""
 
 from __future__ import annotations
 
-import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import torch
 from PIL import Image
-from scipy import stats
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.datasets import CIFAR10
 
-from log.common import atomic_torch_save
-from setting.augmentation import AllSampleViews, TwoStrongViews, build_cifar10_transforms
-from setting.config import DataConfig
-
-
-NUM_CLASSES = 10
-ASYMMETRIC_TRANSITION = {0: 0, 1: 1, 2: 0, 3: 5, 4: 7, 5: 3, 6: 6, 7: 7, 8: 8, 9: 1}
-
-
-@torch.no_grad()
-def inject_instance_dependent_noise(
-    images: Tensor,
-    clean_labels: Tensor,
-    *,
-    noise_rate: float,
-    flip_rate_std: float = 0.1,
-    num_classes: int | None = None,
-    seed: int = 0,
-    device: torch.device | str | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Generate Xia et al. IDN, preserving the RLNLC implementation."""
-    if images.ndim != 4:
-        raise ValueError(f"images must have shape (N, C, H, W), got {tuple(images.shape)}.")
-    if clean_labels.ndim != 1:
-        raise ValueError(f"clean_labels must have shape (N,), got {tuple(clean_labels.shape)}.")
-    if images.shape[0] != clean_labels.numel():
-        raise ValueError("images and clean_labels must contain the same number of samples.")
-    if clean_labels.numel() == 0:
-        raise ValueError("clean_labels must not be empty.")
-    if not 0.0 <= noise_rate < 1.0:
-        raise ValueError("noise_rate must be in [0, 1).")
-    if flip_rate_std <= 0.0:
-        raise ValueError("flip_rate_std must be positive.")
-
-    labels = clean_labels.detach().cpu().to(torch.long).contiguous()
-    inferred_classes = int(labels.max()) + 1
-    class_count = inferred_classes if num_classes is None else num_classes
-    if class_count < 2:
-        raise ValueError("num_classes must be at least 2.")
-    if int(labels.min()) < 0 or int(labels.max()) >= class_count:
-        raise ValueError("clean_labels contain a class outside [0, num_classes).")
-    if noise_rate == 0.0:
-        return labels.clone(), torch.zeros_like(labels, dtype=torch.bool)
-
-    if device is None:
-        compute_device = (
-            torch.device("cuda", 0)
-            if torch.cuda.is_available()
-            else torch.device("cpu")
-        )
-    else:
-        compute_device = torch.device(device)
-    features = images.detach().reshape(images.size(0), -1).to(
-        device=compute_device, dtype=torch.float32
-    )
-
-    # RandomState and the class-wise operations intentionally preserve RLNLC's
-    # random-number sequence and floating-point procedure.
-    rng = np.random.RandomState(seed)
-    distribution = stats.truncnorm(
-        (0.0 - noise_rate) / flip_rate_std,
-        (1.0 - noise_rate) / flip_rate_std,
-        loc=noise_rate,
-        scale=flip_rate_std,
-    )
-    flip_rates = distribution.rvs(labels.numel(), random_state=rng).astype(
-        np.float32, copy=False
-    )
-    weights = torch.from_numpy(
-        rng.randn(class_count, features.size(1), class_count).astype(np.float32, copy=False)
-    ).to(compute_device)
-    probabilities = torch.empty((labels.numel(), class_count), dtype=torch.float32)
-
-    for class_id in range(class_count):
-        indices = labels.eq(class_id).nonzero(as_tuple=False).flatten()
-        if indices.numel() == 0:
-            continue
-        device_indices = indices.to(compute_device)
-        logits = features[device_indices].matmul(weights[class_id])
-        logits[:, class_id] = -torch.inf
-        class_probabilities = torch.softmax(logits, dim=1)
-        class_flip_rates = torch.from_numpy(flip_rates[indices.numpy()]).to(compute_device)
-        class_probabilities.mul_(class_flip_rates[:, None])
-        class_probabilities[:, class_id] = 1.0 - class_flip_rates
-        probabilities[indices] = class_probabilities.cpu()
-
-    probability_array = probabilities.numpy().astype(np.float64, copy=False)
-    probability_array /= probability_array.sum(axis=1, keepdims=True)
-    noisy_array = np.fromiter(
-        (rng.choice(class_count, p=row) for row in probability_array),
-        dtype=np.int64,
-        count=labels.numel(),
-    )
-    noisy_labels = torch.from_numpy(noisy_array).contiguous()
-    return noisy_labels, noisy_labels.ne(labels).contiguous()
-
-
-def inject_closed_set_noise(
-    clean_labels: Tensor,
-    *,
-    noise_kind: str,
-    noise_rate: float,
-    seed: int,
-) -> tuple[Tensor, Tensor]:
-    """Generate the official SSR symmetric or asymmetric CIFAR-10 setup."""
-    if noise_kind not in {"symmetric", "asymmetric"}:
-        raise ValueError("noise_kind must be 'symmetric' or 'asymmetric'.")
-    labels = clean_labels.detach().cpu().to(torch.long).contiguous()
-    noisy = labels.clone()
-    rng = random.Random(seed)
-    indices = list(range(labels.numel()))
-    rng.shuffle(indices)
-    for index in indices[: int(noise_rate * labels.numel())]:
-        if noise_kind == "symmetric":
-            noisy[index] = rng.randint(0, NUM_CLASSES - 1)
-        else:
-            noisy[index] = ASYMMETRIC_TRANSITION[int(labels[index])]
-    return noisy, noisy.ne(labels).contiguous()
-
-
-class CIFAR10TrainDataset(Dataset):
-    def __init__(
-        self,
-        images: np.ndarray,
-        transform: Callable[[Image.Image], object],
-    ) -> None:
-        self.images = images
-        self.transform = transform
-
-    def __getitem__(self, index: int) -> tuple[object, int]:
-        image = Image.fromarray(self.images[index])
-        return self.transform(image), index
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-
-class CIFAR10TestDataset(Dataset):
-    def __init__(
-        self,
-        images: np.ndarray,
-        clean_labels: Tensor,
-        transform: Callable[[Image.Image], Tensor],
-    ) -> None:
-        self.images = images
-        self.clean_labels = clean_labels
-        self.transform = transform
-
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
-        image = self.transform(Image.fromarray(self.images[index]))
-        return image, self.clean_labels[index]
-
-    def __len__(self) -> int:
-        return len(self.images)
+from setting.augmentation import AllSampleViews, TwoStrongViews, build_image_transforms
+from setting.config import AugmentationConfig, DataConfig, SplitConfig
+from setting.image_io import load_rgb_image, verify_image_files
 
 
 @dataclass(frozen=True, slots=True)
-class CIFAR10Data:
-    selected_train: CIFAR10TrainDataset
-    evaluation_train: CIFAR10TrainDataset
-    all_train: CIFAR10TrainDataset
-    test: CIFAR10TestDataset
+class SplitSource:
+    name: str
+    paths: tuple[str, ...]
+    labels: Tensor
+
+
+def _resolve_array(root: Path, filename: str) -> Path:
+    path = Path(filename)
+    path = path if path.is_absolute() else root / path
+    if not path.is_file() and path.name in {
+        f"{split}_{suffix}.npy"
+        for split in ("train", "val", "test")
+        for suffix in ("path", "paths")
+    }:
+        old, new = (
+            ("_paths.npy", "_path.npy")
+            if path.name.endswith("_paths.npy") else ("_path.npy", "_paths.npy")
+        )
+        alias = path.with_name(path.name.replace(old, new))
+        if alias.is_file():
+            return alias
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset array not found: {path}")
+    return path
+
+
+def _load_split(config: DataConfig, split: SplitConfig, name: str) -> SplitSource:
+    paths_file = _resolve_array(config.root, split.paths)
+    labels_file = _resolve_array(config.root, split.labels)
+    paths_array = np.load(paths_file, allow_pickle=False)
+    labels_array = np.load(labels_file, allow_pickle=False)
+    if (
+        paths_array.ndim != 1 or labels_array.ndim != 1
+        or len(paths_array) != len(labels_array)
+    ):
+        raise ValueError(f"{name}: paths and labels must be aligned rank-1 arrays.")
+    if not len(paths_array):
+        raise ValueError(f"{name}: dataset is empty.")
+    if paths_array.dtype.kind not in {"U", "S"}:
+        raise ValueError(f"{name}: paths must be a string array saved without pickle.")
+    if labels_array.dtype.kind not in {"i", "u", "f"}:
+        raise ValueError(f"{name}: labels must be numeric class indices.")
+    if labels_array.dtype.kind == "f" and (
+        not np.isfinite(labels_array).all()
+        or np.any(labels_array != np.floor(labels_array))
+    ):
+        raise ValueError(f"{name}: labels must be finite integer class indices.")
+    minimum, maximum = config.label_offset, config.label_offset + config.num_classes
+    if np.any(labels_array < minimum) or np.any(labels_array >= maximum):
+        raise ValueError(
+            f"{name}: labels must be in [{minimum}, {maximum}); "
+            "check class_names and label_offset."
+        )
+    labels = labels_array.astype(np.int64, copy=False)
+    if config.label_offset:
+        labels = labels - config.label_offset
+    image_root = config.image_root or config.root
+    paths: list[str] = []
+    for raw_path in paths_array:
+        value = raw_path.decode("utf-8") if isinstance(raw_path, bytes) else str(raw_path)
+        if not value.strip():
+            raise ValueError(f"{name}: empty image path at index {len(paths)}.")
+        path = Path(value).expanduser()
+        paths.append(str((path if path.is_absolute() else image_root / path).resolve()))
+    if len(set(paths)) != len(paths):
+        raise ValueError(f"{name}: duplicate image paths are not allowed.")
+    return SplitSource(name, tuple(paths), torch.from_numpy(labels))
+
+
+def inspect_dataset(
+    config: DataConfig, *, report_path: Path | None = None
+) -> dict[str, SplitSource]:
+    """Validate configured arrays, split separation, and optional full image decode."""
+    config.validate()
+    split_configs = (
+        ("train", config.train), ("val", config.validation), ("test", config.test)
+    )
+    sources = {
+        name: _load_split(config, split, name)
+        for name, split in split_configs
+        if split is not None
+    }
+    seen: set[str] = set()
+    for name, source in sources.items():
+        overlap = seen.intersection(source.paths)
+        if overlap:
+            raise ValueError(
+                f"train/val/test paths must be disjoint; "
+                f"{name} overlaps at {min(overlap)}."
+            )
+        seen.update(source.paths)
+        counts = torch.bincount(source.labels, minlength=config.num_classes).tolist()
+        print(
+            f"[{name}] {len(source.paths)} images, "
+            f"class counts={dict(zip(config.class_names, counts))}"
+        )
+    if config.verify_images:
+        tasks = (
+            (name, index, path, config.allow_truncated_images)
+            for name, source in sources.items()
+            for index, path in enumerate(source.paths)
+        )
+        verify_image_files(
+            tasks,
+            count=sum(len(source.paths) for source in sources.values()),
+            workers=config.image_check_workers,
+            report_path=report_path,
+        )
+    return sources
+
+
+class IndexedImageDataset(Dataset):
+    def __init__(
+        self,
+        source: SplitSource,
+        transform: Callable[[Image.Image], object],
+        *,
+        allow_truncated: bool,
+        labeled: bool = False,
+    ) -> None:
+        self.source = source
+        self.transform = transform
+        self.allow_truncated = allow_truncated
+        self.labeled = labeled
+
+    def __len__(self) -> int:
+        return len(self.source.paths)
+
+    def __getitem__(self, index: int) -> tuple[object, int | Tensor]:
+        path = self.source.paths[index]
+        try:
+            image, _ = load_rgb_image(path, allow_truncated=self.allow_truncated)
+        except (OSError, ValueError, Image.DecompressionBombError) as error:
+            raise RuntimeError(f"Failed to load {self.source.name}[{index}]: {path}") from error
+        try:
+            transformed = self.transform(image)
+        finally:
+            image.close()
+        return transformed, self.source.labels[index] if self.labeled else index
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentData:
+    calibration_train: Dataset
+    selected_train: Dataset
+    evaluation_train: Dataset
+    all_train: Dataset
+    validation: Dataset | None
+    test: Dataset | None
     noisy_labels: Tensor
-    clean_labels: Tensor
-    noise_mask: Tensor
+    num_classes: int
+    class_names: tuple[str, ...]
 
 
-def _load_or_create_noisy_labels(
-    images: np.ndarray,
-    clean_labels: Tensor,
+def build_experiment_data(
     config: DataConfig,
-    device: torch.device,
-    seed: int,
-) -> tuple[Tensor, Tensor]:
-    noise_file = config.noise_file(seed)
-    if noise_file.exists():
-        artifact = torch.load(noise_file, map_location="cpu", weights_only=True)
-        expected_metadata = {
-            "dataset": "CIFAR10",
-            "noise_kind": config.noise_kind,
-            "noise_rate": config.noise_rate,
-            "seed": seed,
-        }
-        if config.noise_kind == "idn":
-            expected_metadata["idn_flip_rate_std"] = config.idn_flip_rate_std
-        for key, expected in expected_metadata.items():
-            if artifact.get(key) != expected:
-                raise RuntimeError(
-                    f"Noise artifact metadata mismatch for {key}: {noise_file}"
-                )
-        noisy_labels = artifact["noisy_labels"].to(torch.long).contiguous()
-        if not torch.equal(artifact["clean_labels"].to(torch.long), clean_labels):
-            raise RuntimeError(f"Noise artifact does not match CIFAR-10 labels: {noise_file}")
-        return noisy_labels, noisy_labels.ne(clean_labels).contiguous()
-
-    if config.noise_kind == "idn":
-        raw = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
-        noisy_labels, noise_mask = inject_instance_dependent_noise(
-            raw,
-            clean_labels,
-            noise_rate=config.noise_rate,
-            flip_rate_std=config.idn_flip_rate_std,
-            num_classes=NUM_CLASSES,
-            seed=seed,
-            device=device,
-        )
-    else:
-        noisy_labels, noise_mask = inject_closed_set_noise(
-            clean_labels,
-            noise_kind=config.noise_kind,
-            noise_rate=config.noise_rate,
-            seed=seed,
-        )
-
-    atomic_torch_save(
-        {
-            "dataset": "CIFAR10",
-            "noise_kind": config.noise_kind,
-            "noise_rate": config.noise_rate,
-            "seed": seed,
-            "idn_flip_rate_std": config.idn_flip_rate_std,
-            "noisy_labels": noisy_labels,
-            "clean_labels": clean_labels,
-        },
-        noise_file,
-    )
-    return noisy_labels, noise_mask
-
-
-def build_cifar10_data(
-    config: DataConfig,
-    device: torch.device,
     *,
-    seed: int,
     structural_labels_enabled: bool,
-) -> CIFAR10Data:
-    """Build the four dataset views needed by SSR from one CIFAR-10 copy."""
-    train_source = CIFAR10(root=config.root, train=True, download=config.download)
-    test_source = CIFAR10(root=config.root, train=False, download=config.download)
-    train_images = np.asarray(train_source.data)
-    test_images = np.asarray(test_source.data)
-    clean_labels = torch.as_tensor(train_source.targets, dtype=torch.long)
-    test_labels = torch.as_tensor(test_source.targets, dtype=torch.long)
-    noisy_labels, noise_mask = _load_or_create_noisy_labels(
-        train_images,
-        clean_labels,
-        config,
-        device,
-        seed,
-    )
-    augmentations = build_cifar10_transforms()
+    augmentation: AugmentationConfig,
+    report_path: Path | None = None,
+) -> ExperimentData:
+    """Use provided labels unchanged; transforms run in seeded DataLoader workers."""
+    sources = inspect_dataset(config, report_path=report_path)
+    transforms = build_image_transforms(config, augmentation)
 
-    return CIFAR10Data(
-        selected_train=CIFAR10TrainDataset(
-            train_images,
-            TwoStrongViews(augmentations.strong),
-        ),
-        evaluation_train=CIFAR10TrainDataset(
-            train_images,
-            augmentations.weak,
-        ),
-        all_train=CIFAR10TrainDataset(
-            train_images,
+    def dataset(
+        name: str, transform: Callable, *, labeled: bool = False
+    ) -> IndexedImageDataset | None:
+        source = sources.get(name)
+        if source is None:
+            return None
+        return IndexedImageDataset(
+            source, transform,
+            allow_truncated=config.allow_truncated_images, labeled=labeled,
+        )
+
+    fixed_train = dataset("train", transforms.evaluation)
+    return ExperimentData(
+        calibration_train=fixed_train,
+        selected_train=dataset("train", TwoStrongViews(transforms.strong)),
+        evaluation_train=fixed_train,
+        all_train=dataset(
+            "train",
             AllSampleViews(
-                augmentations.weak,
-                augmentations.strong,
+                transforms.weak, transforms.strong,
                 include_structural_view=structural_labels_enabled,
             ),
         ),
-        test=CIFAR10TestDataset(test_images, test_labels, augmentations.none),
-        noisy_labels=noisy_labels,
-        clean_labels=clean_labels,
-        noise_mask=noise_mask,
+        validation=dataset("val", transforms.evaluation, labeled=True),
+        test=dataset("test", transforms.evaluation, labeled=True),
+        noisy_labels=sources["train"].labels,
+        num_classes=config.num_classes,
+        class_names=tuple(config.class_names),
     )

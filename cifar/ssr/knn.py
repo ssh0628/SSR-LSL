@@ -7,23 +7,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-# Exact k-NN still compares every query with the full bank. Only the number
-# of query rows processed together is reduced for large datasets.
-MAX_SIMILARITY_BYTES = 256 * 1024 * 1024
-
-
-def similarity_chunk_size(
-    query_count: int,
-    bank_count: int,
-    element_size: int,
-    chunks: int,
-) -> int:
-    """Respect the requested chunk count and cap each similarity allocation."""
-    requested_rows = max(1, (query_count + chunks - 1) // chunks)
-    memory_rows = max(1, MAX_SIMILARITY_BYTES // (bank_count * element_size))
-    return min(requested_rows, memory_rows)
-
-
 @torch.no_grad()
 def hard_knn_scores(
     queries: Tensor,
@@ -33,26 +16,20 @@ def hard_knn_scores(
     neighbors: int,
 ) -> Tensor:
     """Uniformly vote over the cosine-nearest labels, including self matches."""
+    similarity = torch.mm(queries, feature_bank_transposed)
+    neighbor_indices = similarity.topk(k=neighbors, dim=-1).indices
+    neighbor_labels = feature_labels[neighbor_indices]
     scores = torch.zeros(
         queries.size(0),
         num_classes,
-        device=feature_labels.device,
+        device=neighbor_labels.device,
         dtype=queries.dtype,
     )
-    chunk_size = similarity_chunk_size(
-        len(queries), feature_bank_transposed.size(1), queries.element_size(), chunks=1
+    scores.scatter_add_(
+        dim=1,
+        index=neighbor_labels,
+        src=torch.ones_like(neighbor_labels, dtype=scores.dtype),
     )
-    for start in range(0, len(queries), chunk_size):
-        end = min(start + chunk_size, len(queries))
-        similarity = torch.mm(queries[start:end], feature_bank_transposed)
-        neighbor_indices = similarity.topk(k=neighbors, dim=-1).indices
-        del similarity
-        neighbor_labels = feature_labels[neighbor_indices]
-        scores[start:end].scatter_add_(
-            dim=1,
-            index=neighbor_labels,
-            src=torch.ones_like(neighbor_labels, dtype=scores.dtype),
-        )
     return scores / neighbors
 
 
@@ -91,12 +68,7 @@ def balanced_knn_scores(
         else F.normalize(current_features, dim=1)
     )
     feature_bank_transposed = normalized_bank.T
-    chunk_size = similarity_chunk_size(
-        len(normalized_queries),
-        len(normalized_bank),
-        normalized_bank.element_size(),
-        chunks,
-    )
+    chunk_size = max(1, (len(current_features) + chunks - 1) // chunks)
     score_parts: list[Tensor] = []
 
     for start in range(0, len(normalized_queries), chunk_size):

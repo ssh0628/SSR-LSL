@@ -1,167 +1,116 @@
 # SSR-LSL
 
-CIFAR-10 noisy-label 학습 코드.
+- 루트: 사용자 이미지 데이터셋 학습
+- `cifar/`: 기존 CIFAR-10 실험 독립 보관
+- config: `setting/config.py`
+- seed: `0`
+- 기본값: pretrained ConvNeXtV2-Tiny, SSR + LSL, Label Wave 저장
+- SSR/LSL 수식·sample selection 유지
+- 입력: 전체 이미지. ROI·bbox cache·추가 noise 생성·sqrt resampling 없음
 
-- SSR baseline
-- Learning with Structural Labels
-- Label Wave checkpoint selection
-- warm-up 없음
-- seed `0`
-- CIFAR-10 전용
-
-## 지원 설정
-
-- Noise
-  - symmetric
-  - asymmetric
-  - IDN
-- Backbone
-  - `preact_resnet18`
-  - `cifar_resnet18`
-  - `cifar_resnet34`
-- LSL
-  - `True`: SSR + LSL
-  - `False`: SSR only
-- Label Wave
-  - `enabled=True`: prediction change 기록 + `label_wave.pt` 저장
-  - `stop_training=False`: 끝까지 학습, 선택 지점만 관찰
-  - `stop_training=True`: patience 충족 시 실제 조기 종료
-
-## 학습 순서
-
-1. 전체 feature 추출
-2. 전체 prediction 추출
-3. confidence 기반 relabel
-4. SSR k-NN sample selection
-5. reverse k-NN structural label 생성
-6. loss 계산 및 update
-
-## Loss
+## 구조
 
 ```text
-L = L_ce + lambda_fc * L_fc + lambda_st * L_st
+run.py
+audit.py
+setting/       config, NPY loader, 이미지 검사, augmentation, model 구성
+models/        backbone
+ssr/           relabel, k-NN selection, loss, 학습
+lsl/           reverse k-NN, structural loss
+label_wave/    prediction change, checkpoint 선택
+log/           config, metric, checkpoint 저장
+cifar/         기존 구조·실험 큐·설정 복사본
 ```
 
-- `L_ce`: selected sample mixup CE
-- `L_fc`: weak/strong feature consistency
-- `L_st`: structural-label mixup CE
-- LSL off: `L_st` 제외
+- 루트와 `cifar/`는 서로 import하지 않음
+- `custom/` 폐기
+- 기존 결과 파일은 이동·삭제하지 않음
 
-## Config
+## 데이터 설정
 
-파일: `setting/config.py`
+`setting/config.py`의 `DataConfig`:
 
-- 프로젝트 경로: `PROJECT_ROOT`
-- LSL on/off: `structural_labels.enabled`
-- Label Wave on/off: `label_wave.enabled`
-- 실제 early stopping: `label_wave.stop_training`
-- Backbone: `model.name`
-- Noise: `data.noise_kind`, `data.noise_rate`
-- Seed: `seed`
+```python
+root = Path("/root/project/dataset/npy_path/modify_npy")
+class_names = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")
+train = SplitConfig("train_path.npy", "train_labels.npy")
+validation = SplitConfig("val_path.npy", "val_labels.npy")
+test = SplitConfig("test_path.npy", "test_labels.npy")
+image_size = 224
+```
 
-논문 기본값:
+- paths: 이미지 경로 문자열 NPY, shape `(N,)`
+- labels: 정수 class index NPY, shape `(N,)`
+- 클래스 순서: `class_names[0]` → label `0`
+- 1부터 시작하는 라벨: `label_offset=1`
+- 상대 이미지 경로: `image_root` 기준. `None`이면 NPY root 기준
+- 기본 파일명은 `*_path.npy`, `*_paths.npy` 둘 다 지원
+- 다른 파일명: `SplitConfig`에서 직접 지정
+- validation/test가 없으면 해당 필드를 `None`
+- `split_config.json`, `classes.json` 필수 아님
+- 클래스 수: `class_names`에서 자동 계산
 
-- epoch: `300`
-- batch size: `128`
-- learning rate: `0.02`
-- `k_st`: `20`
-- `lambda_fc`: `1.0`
-- `lambda_st`: `1.0`
-- mixup alpha: `4.0`
+이미지 검사:
 
-Label Wave 시작값:
-
-- moving-average window: `3`
-- patience: `10`
-- 첫 실험: `enabled=True`, `stop_training=False`
-- 확인 후: `stop_training=True`
-
-주의:
-
-- window `3`: 논문 Appendix E에서 가장 강한 PC/test accuracy 상관
-- patience: 논문에 고정 기본값이 없어 config에서 실험값으로 관리
-- PC 입력: corrected label이 아닌 전체 train sample의 raw model prediction
-- `label_wave.jsonl`의 epoch: 완료된 학습 epoch 수 (`0`은 초기 모델 기준선)
-- `label_wave.pt`: clean validation/test GT를 선택 기준으로 사용하지 않음
-- low/no-noise 또는 매우 강한 regularization: 명확한 turning point가 없을 수 있음
-
-## GPU 설정
-
-논문 재현:
-
-- batch size: `128`
-- learning rate: `0.02`
-- workers: `4`
-- SSR k-NN chunks: `10`
-- LSL k-NN chunks: `10`
-
-RTX 5080 16GB:
-
-- batch size: `256`
-- learning rate: `0.04`
-- workers: `8`
-- prefetch factor: `4`
-- SSR k-NN chunks: `8`
-- LSL k-NN chunks: `8`
-
-H100 NVL 94GB:
-
-- batch size: `512`
-- learning rate: `0.08`
-- workers: `16`
-- prefetch factor: `4`
-- SSR k-NN chunks: `2`
-- LSL k-NN chunks: `2`
-
-주의:
-
-- GPU 설정: 처리량 기준 시작값
-- 논문 비교: 논문 재현값 사용
-- worker 수: CPU core와 storage에 맞춰 조절
-- H100 NVL 2장: 현재 코드는 자동 병렬화하지 않음
+- `verify_images=True`: 학습 전 train/val/test 전체 decode 검사
+- `allow_truncated_images=True`: 잘린 이미지의 decoder 재시도 허용
+- 재시도 성공/실패 경로: `data_audit.jsonl`
+- 완전히 읽을 수 없는 파일: 경로를 모아서 보고하고 중단
+- 검정 이미지 대체·sample 자동 제거 없음
 
 ## 실행
 
 ```bash
 uv sync
-uv run python cifar_ssr.py
+uv run python run.py
 ```
 
-## 출력
+서버:
 
-경로: `outputs/<run_name>/`
-
-- `config.json`
-- `metrics.jsonl`
-- `best.pt`
-- `last.pt`
-- `label_wave.jsonl` (`label_wave.enabled=True`)
-- `label_wave.pt` (`label_wave.enabled=True`, Label Wave 선택 checkpoint)
-
-Checkpoint 기준:
-
-- `best.pt`: test accuracy 최고점. 연구용 oracle 비교
-- `last.pt`: 마지막 실제 학습 epoch
-- `label_wave.pt`: prediction-change 이동평균 기준
-
-## 폴더
-
-```text
-setting/    config, data, augmentation
-models/     backbone
-ssr/        relabel, selection, training
-lsl/        structural label, structural loss
-label_wave/ validation-free checkpoint selection
-log/        metric, checkpoint
+```bash
+cd /root/project/ssr
+nohup /opt/conda/bin/python -u run.py > train.log 2>&1 &
 ```
+
+검사만 실행:
+
+```bash
+uv run python audit.py
+```
+
+기존 CIFAR 실험:
+
+```bash
+uv run python -m cifar.run
+uv run python -m cifar.cifar_ssr
+```
+
+- CIFAR 설정/실험표: [cifar/README.md](cifar/README.md)
+- 모델 이름: `convnextv2_tiny`, `resnet18`, `resnet34` 등 timm backbone
+- 증강: `AugmentationConfig`; 방향이 중요한 데이터는 반전·회전 조절
+- LSL: `structural_labels.enabled`
+- Label Wave 저장: `label_wave.enabled`
+- Label Wave 조기 종료: `label_wave.stop_training`
+- GPU별 batch 시작값: config 상단 주석
+
+## 저장
+
+`outputs/<설정 이름>/<실행 시각>/`
+
+- 실행마다 새 폴더. 명시한 `runtime.run_id` 중복은 차단
+- `config.json`: 실제 설정과 데이터 경로
+- `data_audit.jsonl`: 이미지 검사 결과
+- `metrics.jsonl`: loss, LR, validation accuracy, selected, 실제 label 변경 수·전이
+- `best.pt`: validation accuracy 최고점. validation이 없으면 생성 안 함
+- `last.pt`: 매 epoch 저장. 마지막 test 평가는 이 모델 기준
+- `label_wave.pt`: prediction-change 기준 선택 모델
+- `label_wave.jsonl`: PC, 이동평균, 선택 epoch, patience
+- `stop_training=False`여도 Label Wave checkpoint 저장
+- test는 최종 평가에만 사용
+- 자동 resume는 미구현
 
 ## 참고
 
-- clean train label: metric 계산에만 사용
-- 학습 supervision: noisy/relabelled/structural label만 사용
-- SSR 논문: <https://bmvc2022.mpi-inf.mpg.de/0372.pdf>
-- SSR 저자 코드: <https://github.com/MrChenFeng/SSR_BMVC2022>
-- LSL 논문: <https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_Learning_with_Structural_Labels_for_Learning_with_Noisy_Labels_CVPR_2024_paper.pdf>
-- LSL 저자 코드: 공식 공개 저장소 확인되지 않음. 논문 Algorithm 1/2 기준 구현
-- Label Wave 논문: <https://proceedings.iclr.cc/paper_files/paper/2024/file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf>
-- Label Wave 저자 코드: <https://github.com/tmllab/2024_ICLR_LabelWave>
+- SSR: [BMVC 2022 논문](https://bmvc2022.mpi-inf.mpg.de/0372.pdf) / [저자 코드](https://github.com/MrChenFeng/SSR_BMVC2022)
+- LSL: [CVPR 2024 논문](https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_Learning_with_Structural_Labels_for_Learning_with_Noisy_Labels_CVPR_2024_paper.pdf), Algorithm 1/2 기준
+- Label Wave: [ICLR 2024 논문](https://proceedings.iclr.cc/paper_files/paper/2024/file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf) / [저자 코드](https://github.com/tmllab/2024_ICLR_LabelWave)

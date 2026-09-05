@@ -1,4 +1,4 @@
-"""일반 이미지 backbone과 SSR projection heads 구성."""
+"""선택한 CIFAR backbone과 SSR projection heads 구성."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.backbone import build_encoder
-from setting.config import ModelConfig
+from cifar.models.cifar_resnet import build_cifar_resnet
+from cifar.models.preresnet import PreResNet18
+from cifar.setting.config import ModelConfig
 
 
 BatchNorm: TypeAlias = (
@@ -46,17 +47,24 @@ class SSRNetworks:
         return self.encoder, self.classifier, self.projector, self.predictor
 
 
+def _build_encoder(config: ModelConfig, num_classes: int) -> tuple[nn.Module, int]:
+    if config.name == "preact_resnet18":
+        encoder = PreResNet18(num_classes=num_classes)
+        feature_dim = encoder.fc.in_features
+    else:
+        encoder = build_cifar_resnet(config.name, num_classes=num_classes)
+        feature_dim = encoder.feature_dim
+    encoder.fc = nn.Identity()
+    return encoder, feature_dim
+
+
 def build_ssr_networks(
     config: ModelConfig,
     device: torch.device,
-    num_classes: int,
+    num_classes: int = 10,
 ) -> SSRNetworks:
     """backbone만 교체 가능하게 두고 SSR heads는 공식 구성 그대로 생성."""
-    encoder, feature_dim = build_encoder(
-        config.name,
-        pretrained=config.pretrained,
-        drop_path_rate=config.drop_path_rate,
-    )
+    encoder, feature_dim = _build_encoder(config, num_classes)
     classifier = nn.Linear(feature_dim, num_classes)
     projector = nn.Sequential(
         nn.Linear(feature_dim, 256),

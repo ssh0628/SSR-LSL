@@ -1,4 +1,4 @@
-"""CIFAR-10 transforms used by the official SSR training recipe."""
+"""Full-image transforms and independent SSR/LSL training views."""
 
 from __future__ import annotations
 
@@ -8,24 +8,23 @@ from typing import Callable
 from PIL import Image
 from torch import Tensor
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
-from setting.autoaugment import CIFAR10Policy
+from setting.config import AugmentationConfig, DataConfig
 
 
-CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR10_STD = (0.2023, 0.1994, 0.2010)
 ImageTransform = Callable[[Image.Image], Tensor]
 
 
 @dataclass(frozen=True, slots=True)
-class CIFAR10Transforms:
-    none: ImageTransform
+class ImageTransforms:
+    evaluation: ImageTransform
     weak: ImageTransform
     strong: ImageTransform
 
 
 class TwoStrongViews:
-    """The two strong views used by SSR's supervised mixup branch."""
+    """Two independent strong views for SSR's selected-sample mixup CE."""
 
     def __init__(self, strong_transform: ImageTransform) -> None:
         self.strong_transform = strong_transform
@@ -35,11 +34,7 @@ class TwoStrongViews:
 
 
 class AllSampleViews:
-    """전체 데이터 branch의 weak/strong view 묶음.
-
-    LSL이 꺼지면 공식 SSR과 같은 ``[weak, strong]``만 생성한다. 켜지면
-    structural mixup 전용 independent strong view를 하나 더 생성한다.
-    """
+    """Weak/strong feature-consistency views, plus LSL's independent strong view."""
 
     def __init__(
         self,
@@ -59,24 +54,26 @@ class AllSampleViews:
         return views
 
 
-def build_cifar10_transforms() -> CIFAR10Transforms:
-    normalize = transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD)
-    weak = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]
+def build_image_transforms(data: DataConfig, config: AugmentationConfig) -> ImageTransforms:
+    resize = transforms.Resize(
+        (data.image_size, data.image_size), interpolation=InterpolationMode.BICUBIC
     )
-    strong = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            CIFAR10Policy(),
-            transforms.ToTensor(),
-            normalize,
+    to_tensor = transforms.ToTensor()
+    normalize = transforms.Normalize(data.mean, data.std)
+
+    def augmented(rotation: float, *, color: bool) -> ImageTransform:
+        operations = [
+            resize,
+            transforms.RandomHorizontalFlip(config.horizontal_flip),
+            transforms.RandomVerticalFlip(config.vertical_flip),
+            transforms.RandomRotation(rotation),
         ]
+        if color:
+            operations.append(transforms.ColorJitter(*config.color_jitter))
+        return transforms.Compose([*operations, to_tensor, normalize])
+
+    return ImageTransforms(
+        evaluation=transforms.Compose([resize, to_tensor, normalize]),
+        weak=augmented(config.weak_rotation, color=False),
+        strong=augmented(config.strong_rotation, color=True),
     )
-    none = transforms.Compose([transforms.ToTensor(), normalize])
-    return CIFAR10Transforms(none=none, weak=weak, strong=strong)

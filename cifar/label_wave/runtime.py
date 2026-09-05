@@ -7,10 +7,10 @@ from pathlib import Path
 
 from torch import Tensor
 
-from label_wave.tracker import LabelWaveObservation, LabelWaveTracker
-from log.checkpoint import CheckpointManager
-from log.common import JsonlWriter
-from setting.config import LabelWaveConfig
+from cifar.label_wave.tracker import LabelWaveObservation, LabelWaveTracker
+from cifar.log.checkpoint import CheckpointManager
+from cifar.log.common import JsonlWriter
+from cifar.setting.config import LabelWaveConfig
 
 
 class LabelWaveRun:
@@ -46,14 +46,21 @@ class LabelWaveRun:
         predictions: Tensor,
         *,
         completed_epochs: int,
-        validation_accuracy: float | None = None,
+        test_accuracy: float | None = None,
+        reference_accuracy: float | None = None,
+        reference_metric: str = "test_accuracy",
     ) -> LabelWaveObservation:
         if self._writer is None:
             raise RuntimeError("LabelWaveRun must be used as a context manager.")
 
+        if test_accuracy is not None and reference_accuracy is not None:
+            raise ValueError("Pass test_accuracy or reference_accuracy, not both.")
+        accuracy = (
+            test_accuracy if reference_accuracy is None else reference_accuracy
+        )
         observation = self.tracker.update(predictions, epoch=completed_epochs)
         values = asdict(observation)
-        values["validation_accuracy"] = validation_accuracy
+        values[reference_metric] = accuracy
         self._writer.write(values)
 
         if observation.is_candidate:
@@ -61,7 +68,8 @@ class LabelWaveRun:
                 "label_wave.pt",
                 completed_epochs - 1,
                 label_wave=asdict(observation),
-                metrics={"validation_accuracy": validation_accuracy},
+                test_accuracy=(accuracy if reference_metric == "test_accuracy" else None),
+                metrics={reference_metric: accuracy},
             )
             print(
                 f"label_wave candidate_epoch={completed_epochs} "

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
 
 import torch
 from torch import Tensor
@@ -11,10 +10,10 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from lsl import structural_mixup_loss
-from setting.config import ExperimentConfig
-from setting.model import SSRNetworks
-from ssr.losses import (
+from cifar.lsl import structural_mixup_loss
+from cifar.setting.config import ExperimentConfig
+from cifar.setting.model import SSRNetworks
+from cifar.ssr.losses import (
     mixup_hard_label_views,
     negative_cosine_similarity,
     soft_cross_entropy,
@@ -40,13 +39,6 @@ class TrainingLosses:
     supervised_loss: float
     feature_consistency_loss: float
     structural_loss: float | None
-
-
-def _loss_value(loss: Tensor, name: str) -> float:
-    value = loss.item()
-    if not isfinite(value):
-        raise FloatingPointError(f"Non-finite {name} loss; optimizer step was not applied.")
-    return value
 
 
 def train_epoch(
@@ -88,37 +80,26 @@ def train_epoch(
         )
         supervised_logits = networks.classifier(networks.encoder(mixed_inputs))
         supervised_loss = soft_cross_entropy(supervised_logits, mixed_targets)
-        supervised_value = _loss_value(supervised_loss, "supervised")
-        # Additive loss gradients accumulate at the same parameter values.
-        # Backpropagate each branch before allocating the next encoder graph.
-        supervised_loss.backward()
-        supervised_average.update(supervised_value)
-        del supervised_logits, supervised_loss, mixed_inputs, mixed_targets
-        del first_selected, second_selected, selected_labels
 
         weak_view = all_views[0].to(device, non_blocking=True)
         first_strong_view = all_views[1].to(device, non_blocking=True)
-        # SSR stops gradients through its weak target. Train-mode BN updates
-        # and stochastic forward calls are still performed in the same order.
-        with torch.no_grad():
-            weak_projection = networks.projector(networks.encoder(weak_view))
+        weak_projection = networks.projector(networks.encoder(weak_view))
         strong_projection = networks.projector(networks.encoder(first_strong_view))
 
         # p_weak는 loss에 직접 쓰이지 않지만
         # 공식 SSR의 predictor BN 갱신에 필요하다.
-        with torch.no_grad():
-            networks.predictor(weak_projection)
+        networks.predictor(weak_projection)
         strong_prediction = networks.predictor(strong_projection)
         consistency_loss = negative_cosine_similarity(
             strong_prediction,
             weak_projection,
         )
-        consistency_value = _loss_value(consistency_loss, "feature-consistency")
-        (config.ssr.feature_consistency_weight * consistency_loss).backward()
-        consistency_average.update(consistency_value)
-        del consistency_loss, strong_prediction, strong_projection, weak_projection
-        del weak_view
+        total_loss = (
+            supervised_loss
+            + config.ssr.feature_consistency_weight * consistency_loss
+        )
 
+        current_structural_loss = None
         if structural_targets is not None:
             if len(all_views) != 3:
                 raise RuntimeError("LSL requires [weak, strong, strong] all-sample views.")
@@ -132,16 +113,18 @@ def train_epoch(
                 batch_structural_targets,
                 mixup_alpha=config.ssr.mixup_alpha,
             )
-            structural_value = _loss_value(current_structural_loss, "structural")
-            (config.structural_labels.loss_weight * current_structural_loss).backward()
-            structural_average.update(structural_value)
-            del current_structural_loss, batch_structural_targets, second_strong_view
+            total_loss = (
+                total_loss
+                + config.structural_labels.loss_weight * current_structural_loss
+            )
         elif len(all_views) != 2:
             raise RuntimeError("SSR requires [weak, strong] all-sample views.")
 
+        total_loss.backward()
         optimizer.step()
-        del first_strong_view
 
+        supervised_average.update(supervised_loss.item())
+        consistency_average.update(consistency_loss.item())
         encoder_learning_rate = optimizer.param_groups[0]["lr"]
         head_learning_rate = (
             optimizer.param_groups[1]["lr"]
@@ -155,7 +138,8 @@ def train_epoch(
         }
         if encoder_learning_rate != head_learning_rate:
             postfix["enc_lr"] = f"{encoder_learning_rate:.6f}"
-        if structural_average is not None:
+        if structural_average is not None and current_structural_loss is not None:
+            structural_average.update(current_structural_loss.item())
             postfix["st"] = f"{structural_average.value:.4f}"
         progress.set_postfix(**postfix)
 
@@ -182,12 +166,7 @@ def test_accuracy(
     for images, labels in tqdm(loader, desc=description, leave=False):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        logits = networks.classifier(networks.encoder(images))
-        if not torch.isfinite(logits).all().item():
-            raise FloatingPointError(f"{description} model produced non-finite logits.")
-        predictions = logits.argmax(dim=1)
+        predictions = networks.classifier(networks.encoder(images)).argmax(dim=1)
         correct += predictions.eq(labels).sum()
         samples += images.size(0)
-    if samples == 0:
-        raise RuntimeError(f"{description} loader is empty.")
     return float((correct / samples).item())

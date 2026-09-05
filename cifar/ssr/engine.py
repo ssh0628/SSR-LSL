@@ -1,11 +1,10 @@
-"""General image-dataset SSR/LSL training and checkpoint orchestration."""
+"""CIFAR-10 SSR/LSL 실행 orchestration."""
 
 from __future__ import annotations
 
 import random
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
 from math import cos, pi
 from typing import Any
 
@@ -15,24 +14,25 @@ from torch.optim import AdamW, Optimizer, SGD
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 
-from label_wave import LabelWaveRun
-from log.checkpoint import CheckpointManager
-from log.common import JsonlWriter, write_config
-from setting.config import ExperimentConfig
-from setting.data import ExperimentData, build_experiment_data
-from setting.model import SSRNetworks, build_ssr_networks, calibrate_batch_norm
-from ssr.evaluation import evaluate_epoch, predict_training_labels, selection_metrics
-from ssr.sampler import ClassBalancedSampler
-from ssr.selection import SelectionResult
-from ssr.trainer import test_accuracy, train_epoch
+from cifar.label_wave import LabelWaveRun
+from cifar.log.checkpoint import CheckpointManager
+from cifar.log.common import JsonlWriter, write_config
+from cifar.setting.config import ExperimentConfig
+from cifar.setting.data import ExperimentData, build_experiment_data
+from cifar.setting.model import SSRNetworks, build_ssr_networks, calibrate_batch_norm
+from cifar.ssr.evaluation import evaluate_epoch, predict_training_labels, selection_metrics
+from cifar.ssr.sampler import ClassBalancedSampler
+from cifar.ssr.selection import SelectionResult
+from cifar.ssr.trainer import test_accuracy, train_epoch
 
 
 @dataclass(frozen=True, slots=True)
 class EpochLoaders:
     evaluation: DataLoader
     all_samples: DataLoader
-    validation: DataLoader | None
-    test: DataLoader | None
+    reference: DataLoader
+    test: DataLoader
+    reference_metric: str
 
 
 def seed_everything(seed: int) -> None:
@@ -69,6 +69,10 @@ def _build_epoch_loaders(
     device: torch.device,
 ) -> EpochLoaders:
     options = _loader_options(config, device)
+    reference_dataset = data.validation if data.validation is not None else data.test
+    reference_metric = (
+        "validation_accuracy" if data.validation is not None else "test_accuracy"
+    )
     return EpochLoaders(
         evaluation=DataLoader(data.evaluation_train, shuffle=False, **options),
         all_samples=DataLoader(
@@ -77,14 +81,9 @@ def _build_epoch_loaders(
             drop_last=True,
             **options,
         ),
-        validation=(
-            DataLoader(data.validation, shuffle=False, **options)
-            if data.validation is not None else None
-        ),
-        test=(
-            DataLoader(data.test, shuffle=False, **options)
-            if data.test is not None else None
-        ),
+        reference=DataLoader(reference_dataset, shuffle=False, **options),
+        test=DataLoader(data.test, shuffle=False, **options),
+        reference_metric=reference_metric,
     )
 
 
@@ -178,45 +177,17 @@ def _build_scheduler(
     return LambdaLR(optimizer, lr_lambda=cosine_multiplier)
 
 
-def _prepare_config(config: ExperimentConfig) -> ExperimentConfig:
-    """Reserve a fresh output directory before writing any run artifact."""
-
-    config.validate()
-    automatic_id = config.runtime.run_id is None
-    # Create the shared config directory once so invalid parent paths fail
-    # immediately instead of being mistaken for a timestamp collision.
-    (config.runtime.output_root / config.run_name).mkdir(parents=True, exist_ok=True)
-    while True:
-        if automatic_id:
-            run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-            resolved = replace(config, runtime=replace(config.runtime, run_id=run_id))
-        else:
-            resolved = config
-        try:
-            resolved.run_dir.mkdir(exist_ok=False)
-        except FileExistsError as error:
-            if automatic_id:
-                continue
-            raise RuntimeError(
-                f"Run directory already exists: {resolved.run_dir}. "
-                "Choose another runtime.run_id or use None for a fresh run."
-            ) from error
-        return resolved
-
-
-def run(config: ExperimentConfig) -> float | None:
+def run(config: ExperimentConfig) -> float:
     """warm-up 없이 매 epoch relabel -> select -> optional LSL -> train."""
-    config = _prepare_config(config)
-    print(f"run_dir={config.run_dir}")
-    write_config(config, config.run_dir)
+    config.validate()
     device = config.resolve_device()
     seed_everything(config.seed)
 
     data = build_experiment_data(
         config.data,
+        device,
+        seed=config.seed,
         structural_labels_enabled=config.structural_labels.enabled,
-        augmentation=config.augmentation,
-        report_path=config.run_dir / "data_audit.jsonl",
     )
     training_samples = int(data.noisy_labels.numel())
     if training_samples < config.training.batch_size:
@@ -239,10 +210,13 @@ def run(config: ExperimentConfig) -> float | None:
         )
     loaders = _build_epoch_loaders(data, config, device)
     noisy_labels = data.noisy_labels.to(device)
+    clean_labels = (
+        data.clean_labels.to(device) if data.clean_labels is not None else None
+    )
     networks = build_ssr_networks(config.model, device, data.num_classes)
     if (
         config.model.calibrate_initial_batch_norm
-        and not config.model.pretrained
+        and config.model.name in {"cifar_resnet18", "cifar_resnet34"}
     ):
         calibration_batches = calibrate_batch_norm(
             _build_calibration_loader(data, config, device),
@@ -253,11 +227,17 @@ def run(config: ExperimentConfig) -> float | None:
     optimizer = _build_optimizer(networks, config)
     checkpoints = CheckpointManager(config.run_dir, networks, optimizer, config)
     scheduler = _build_scheduler(optimizer, config)
+    # Persist only after data, model, optimizer, and scheduler construction succeeds.
+    write_config(config, config.run_dir)
 
-    print(f"device={device} run={config.run_name}")
-    if loaders.validation is None:
-        print("validation=disabled; best.pt omitted; last.pt saved every epoch.")
-    best_accuracy: float | None = None
+    noise_summary = (
+        f"actual_noise_rate={float(data.noise_mask.float().mean().item()):.4f}"
+        if data.noise_mask is not None
+        else "actual_noise_rate=unknown"
+    )
+    print(f"device={device} run={config.run_name} {noise_summary}")
+    # Ensure the first completed epoch always produces a best checkpoint.
+    best_accuracy = float("-inf")
     last_accuracy: float | None = None
     last_completed_epoch = -1
     stopped_by_label_wave = False
@@ -285,7 +265,8 @@ def run(config: ExperimentConfig) -> float | None:
                 observation = label_wave.observe(
                     supervision.predictions,
                     completed_epochs=epoch,
-                    validation_accuracy=last_accuracy,
+                    reference_accuracy=last_accuracy,
+                    reference_metric=loaders.reference_metric,
                 )
                 if observation.should_stop and config.label_wave.stop_training:
                     stopped_by_label_wave = True
@@ -310,27 +291,21 @@ def run(config: ExperimentConfig) -> float | None:
                 device,
                 epoch,
             )
-            scheduler.step()
-            last_completed_epoch = epoch
-            current_accuracy = None
-            try:
-                if loaders.validation is not None:
-                    current_accuracy = test_accuracy(
-                        loaders.validation, networks, device, description="Validation"
-                    )
-            finally:
-                # A validation error must not discard the just-trained model.
-                # Save once per completed epoch, even when evaluation fails.
-                checkpoints.save(
-                    "last.pt",
-                    epoch,
-                    metrics={"validation_accuracy": current_accuracy},
-                )
-            last_accuracy = current_accuracy
-
-            is_best = current_accuracy is not None and (
-                best_accuracy is None or current_accuracy > best_accuracy
+            current_accuracy = test_accuracy(
+                loaders.reference,
+                networks,
+                device,
+                description=(
+                    "Validation"
+                    if loaders.reference_metric == "validation_accuracy"
+                    else "Test"
+                ),
             )
+            scheduler.step()
+            last_accuracy = current_accuracy
+            last_completed_epoch = epoch
+
+            is_best = current_accuracy > best_accuracy
             if is_best:
                 best_accuracy = current_accuracy
             values = {
@@ -338,34 +313,36 @@ def run(config: ExperimentConfig) -> float | None:
                 "learning_rate": learning_rate,
                 "encoder_learning_rate": encoder_learning_rate,
                 **asdict(losses),
-                "validation_accuracy": current_accuracy,
-                "best_validation_accuracy": best_accuracy,
+                loaders.reference_metric: current_accuracy,
+                f"best_{loaders.reference_metric}": best_accuracy,
                 "best_accuracy": best_accuracy,
                 **selection_metrics(
                     supervision.selection,
                     noisy_labels,
+                    clean_labels,
                     num_classes=config.data.num_classes,
                 ),
             }
             metrics_writer.write(values)
-            accuracy_summary = (
-                f"validation_accuracy={current_accuracy:.4f} best={best_accuracy:.4f}"
-                if current_accuracy is not None and best_accuracy is not None
-                else "validation_accuracy=unavailable"
-            )
             print(
                 f"epoch={epoch + 1}/{config.training.epochs} "
                 f"selected={values['selected']} "
                 f"relabel_candidates={values['relabel_candidates']} "
                 f"label_changes={values['label_changes']} "
-                f"{accuracy_summary}"
+                f"{loaders.reference_metric}={current_accuracy:.4f} "
+                f"best={best_accuracy:.4f}"
             )
 
             if is_best:
                 checkpoints.save(
                     "best.pt",
                     epoch,
-                    metrics={"validation_accuracy": current_accuracy},
+                    test_accuracy=(
+                        current_accuracy
+                        if loaders.reference_metric == "test_accuracy"
+                        else None
+                    ),
+                    metrics={loaders.reference_metric: current_accuracy},
                 )
 
         if label_wave is not None and not stopped_by_label_wave:
@@ -377,19 +354,24 @@ def run(config: ExperimentConfig) -> float | None:
             label_wave.observe(
                 final_predictions,
                 completed_epochs=last_completed_epoch + 1,
-                validation_accuracy=last_accuracy,
+                reference_accuracy=last_accuracy,
+                reference_metric=loaders.reference_metric,
             )
 
-    if loaders.test is not None:
-        final_test_accuracy = test_accuracy(loaders.test, networks, device, description="Test")
+    final_test_accuracy = (
+        last_accuracy
+        if loaders.reference_metric == "test_accuracy"
+        else test_accuracy(loaders.test, networks, device, description="Test")
+    )
+    if loaders.reference_metric != "test_accuracy":
         print(f"final_test_accuracy={final_test_accuracy:.4f} (last checkpoint)")
-        checkpoints.save(
-            "last.pt",
-            last_completed_epoch,
-            test_accuracy=final_test_accuracy,
-            metrics={
-                "validation_accuracy": last_accuracy,
-                "test_accuracy": final_test_accuracy,
-            },
-        )
+    checkpoints.save(
+        "last.pt",
+        last_completed_epoch,
+        test_accuracy=final_test_accuracy,
+        metrics={
+            loaders.reference_metric: last_accuracy,
+            "test_accuracy": final_test_accuracy,
+        },
+    )
     return best_accuracy

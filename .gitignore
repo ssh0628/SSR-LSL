@@ -28,3 +28,4 @@ htmlcov/
 # Local datasets and experiment artifacts
 data/
 outputs/
+tests

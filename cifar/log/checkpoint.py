@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 
 from torch.optim import Optimizer
 
-from log.common import atomic_torch_save
-from setting.config import ExperimentConfig
-from setting.model import SSRNetworks
+from cifar.log.common import atomic_torch_save
+from cifar.setting.config import ExperimentConfig
+from cifar.setting.model import SSRNetworks
 
 
 class CheckpointManager:
@@ -42,15 +41,6 @@ class CheckpointManager:
         state: dict[str, Any] = {
             "cur_epoch": epoch,
             "model_name": self.config.model.name,
-            "model_config": asdict(self.config.model),
-            "class_names": list(self.config.data.class_names),
-            "num_classes": self.config.data.num_classes,
-            "input_config": {
-                "image_size": self.config.data.image_size,
-                "mean": list(self.config.data.mean),
-                "std": list(self.config.data.std),
-                "label_offset": self.config.data.label_offset,
-            },
             "structural_labels_enabled": self.config.structural_labels.enabled,
             "classifier": self.networks.classifier.state_dict(),
             "encoder": self.networks.encoder.state_dict(),

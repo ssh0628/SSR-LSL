@@ -9,10 +9,10 @@ import torch
 from torch import nn
 from torch.optim import SGD
 
-from label_wave import LabelWaveRun, LabelWaveTracker
-from log.checkpoint import CheckpointManager
-from setting.config import CONFIG, LabelWaveConfig, RuntimeConfig, TrainingConfig
-from setting.model import SSRNetworks
+from cifar.label_wave import LabelWaveRun, LabelWaveTracker
+from cifar.log.checkpoint import CheckpointManager
+from cifar.setting.config import CONFIG, LabelWaveConfig, RuntimeConfig, TrainingConfig
+from cifar.setting.model import SSRNetworks
 
 
 class LabelWaveTrackerTest(unittest.TestCase):

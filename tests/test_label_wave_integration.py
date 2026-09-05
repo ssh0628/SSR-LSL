@@ -7,9 +7,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from setting.config import CONFIG, SSRConfig, StructuralLabelsConfig
-from setting.model import SSRNetworks
-from ssr.evaluation import evaluate_epoch
+from cifar.setting.config import CONFIG, SSRConfig, StructuralLabelsConfig
+from cifar.setting.model import SSRNetworks
+from cifar.ssr.evaluation import evaluate_epoch
 
 
 class LabelWaveIntegrationTest(unittest.TestCase):

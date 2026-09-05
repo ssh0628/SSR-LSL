@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ssr.knn import balanced_knn_scores
+from cifar.ssr.knn import balanced_knn_scores
 
 
 @dataclass(frozen=True, slots=True)
