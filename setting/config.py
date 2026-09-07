@@ -7,22 +7,24 @@ import json
 from dataclasses import asdict, dataclass, field
 from math import isfinite
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
 
-# - 프로젝트 루트: 아래 상수에서 직접 지정 가능
-# PROJECT_ROOT = Path("/root/project/ssr").expanduser().resolve()
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# - 경로: 아래 값 직접 수정
+PROJECT_ROOT = Path(__file__).resolve().parents[1]  # 프로젝트
+DATASET_ROOT = Path("/root/project/dataset/npy_path/modify_npy")  # 기존 NPY·bbox 입력
+OUTPUT_ROOT = PROJECT_ROOT / "outputs"  # 학습 결과
 
-# - ConvNeXtV2-Tiny / 224px / BF16 AMP 기준
-# - RTX 5080 16 GB: batch_size=16, eval_batch_size=64, prefetch_factor=1
-# - 현재 서버: H100 NVL 1 GPU / 16 vCPU / RAM 200 GB
-# - H100 설정: batch_size=512, eval_batch_size=1024, prefetch_factor=4
-# - 학습 worker: 8개 × 두 loader = 16개; evaluation worker=8
-# - 처리량 우선 설정; 서버 실측 최적값은 아님
-# - LR: GPU에 따른 자동 변경 없음
+# - H100 NVL: batch 256/1024, workers 16×2/32, prefetch 2; train 512 OOM
+# - RTX 5080: train 16 / eval 64 / prefetch 1; 시작값
 OptimizerName = Literal["sgd", "adamw"]
+MissingBBoxPolicy = Literal["drop", "error", "full"]
+
+
+def validate_missing_bbox(policy: str) -> None:
+    if policy not in get_args(MissingBBoxPolicy):
+        raise ValueError(f"data.missing_bbox must be one of {get_args(MissingBBoxPolicy)}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,36 +33,43 @@ class SplitConfig:
 
     paths: str  # 이미지 경로 NPY
     labels: str  # 정수 class index NPY
+    bboxes: str | None = None  # None: bbox cache 자동 탐색·생성
 
     def validate(self) -> None:
         if not self.paths.strip() or not self.labels.strip():
             raise ValueError("Split paths/labels filenames must not be empty.")
+        if self.bboxes is not None and not self.bboxes.strip():
+            raise ValueError("Split bbox filename must not be empty.")
 
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    """사용자가 준비한 이미지 경로/라벨 NPY. 추가 noise나 sqrt sampling 없음."""
+    """이미지·라벨·bbox 입력."""
 
-    root: Path = Path("/root/project/dataset/npy_path/modify_npy")  # NPY 저장 위치
+    root: Path = field(default_factory=lambda: DATASET_ROOT)  # NPY 루트
     image_root: Path | None = None  # 상대 이미지 경로 기준; None: root
-    name: str = "a1-a7"  # 결과 폴더용 데이터셋 이름
-    class_names: tuple[str, ...] = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")  # label 순서
+    annotation_root: Path | None = None  # JSON 루트; None: 이미지 옆
+    name: str = "a1-a7"  # 실험 이름
+    class_names: tuple[str, ...] = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")  # 라벨 순서
     train: SplitConfig = field(
         default_factory=lambda: SplitConfig("train_path.npy", "train_labels.npy")
     )
     validation: SplitConfig | None = field(
         default_factory=lambda: SplitConfig("val_path.npy", "val_labels.npy")
-    )  # None: validation 및 best.pt 생략
+    )  # None: validation 생략
     test: SplitConfig | None = field(
         default_factory=lambda: SplitConfig("test_path.npy", "test_labels.npy")
-    )  # None: 최종 test 평가 생략
-    label_offset: int = 0  # 라벨 시작 번호: 0 또는 1
-    image_size: int = 224  # 전체 이미지 resize 크기; ROI/cache 미사용
-    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # RGB 평균
-    std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # RGB 표준편차
-    allow_truncated_images: bool = True  # 잘린 이미지 decoder 재시도
-    verify_images: bool = False  # 모델 생성 전 전체 이미지 decode 검사
-    image_check_workers: int = 8  # 사전 검사 worker 수
+    )  # None: test 생략
+    label_offset: int = 0  # 라벨 시작 번호
+    crop_bbox: bool = True  # 전체 이미지에서 bbox crop
+    missing_bbox: MissingBBoxPolicy = "drop"  # 누락: 제외 / 중단 / 전체 이미지
+    image_size: int = 224  # crop 후 resize
+    bbox_workers: int = 16  # bbox JSON 확인 worker
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # 정규화 평균
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # 정규화 표준편차
+    allow_truncated_images: bool = True  # 잘린 이미지 재시도
+    verify_images: bool = False  # 사전 decode 검사
+    image_check_workers: int = 8  # 검사 worker
 
     @property
     def num_classes(self) -> int:
@@ -73,6 +82,9 @@ class DataConfig:
             raise ValueError("data.train must specify paths and labels files.")
         if self.image_root is not None and not self.image_root.is_absolute():
             raise ValueError("data.image_root must be an absolute path.")
+        if self.annotation_root is not None and not self.annotation_root.is_absolute():
+            raise ValueError("data.annotation_root must be an absolute path.")
+        validate_missing_bbox(self.missing_bbox)
         if (
             not self.name
             or not self.name.isascii()
@@ -99,16 +111,18 @@ class DataConfig:
             raise ValueError("data.mean/std must have three finite channels and positive std.")
         if self.image_check_workers < 1:
             raise ValueError("data.image_check_workers must be positive.")
+        if self.bbox_workers < 1:
+            raise ValueError("data.bbox_workers must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
 class AugmentationConfig:
-    """도메인에 맞춰 조절하는 증강. 평가 입력에는 적용하지 않는다."""
+    """학습 전용 증강."""
 
     horizontal_flip: float = 0.5  # 좌우 반전 확률
-    vertical_flip: float = 0.5  # 상하 반전 확률; 방향 중요 시 0
-    weak_rotation: float = 10.0  # weak view 회전 범위 ±degree
-    strong_rotation: float = 15.0  # strong view 회전 범위 ±degree
+    vertical_flip: float = 0.5  # 상하 반전 확률
+    weak_rotation: float = 10.0  # weak 회전 ±도
+    strong_rotation: float = 15.0  # strong 회전 ±도
     color_jitter: tuple[float, float, float, float] = (0.1, 0.1, 0.05, 0.02)  # 밝기/대비/채도/색상
 
     def validate(self) -> None:
@@ -126,12 +140,12 @@ class AugmentationConfig:
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """timm backbone 이름. pretrained encoder + 새 SSR heads."""
+    """Backbone 설정."""
 
-    name: str = "convnextv2_tiny"  # timm 모델명; resnet18 / resnet34 등
-    pretrained: bool = True  # pretrained weight 사용 여부
-    drop_path_rate: float = 0.2  # stochastic-depth 비율
-    calibrate_initial_batch_norm: bool = True  # scratch encoder BN 통계 초기 보정
+    name: str = "convnextv2_tiny"  # timm 모델명
+    pretrained: bool = True  # 사전학습 가중치
+    drop_path_rate: float = 0.2  # stochastic depth
+    calibrate_initial_batch_norm: bool = True  # scratch 모델 BN 보정
 
     def validate(self) -> None:
         if not self.name.strip():
@@ -144,14 +158,11 @@ class ModelConfig:
 class SSRConfig:
     """SSR relabel, sample selection과 loss 설정."""
 
-    # - relabel 조건: confidence > tau_r
-    relabel_threshold: float = 0.9
-    # - selection 기준: tau_s=1이면 최다 k-NN vote와 일치
-    selection_threshold: float = 1.0
-    neighbors: int = 200  # SSR cosine k-NN 이웃 수
-    # - SSR k-NN query 분할 수; 메모리 조절용
-    knn_chunks: int = 10
-    feature_consistency_weight: float = 1.0  # feature-consistency loss 가중치
+    relabel_threshold: float = 0.9  # confidence > tau_r
+    selection_threshold: float = 1.0  # 1: 최다 k-NN vote 일치
+    neighbors: int = 200  # k-NN 이웃 수
+    knn_chunks: int = 10  # query 분할 수
+    feature_consistency_weight: float = 1.0  # consistency loss 가중치
     mixup_alpha: float = 4.0  # mixup Beta(alpha, alpha)
 
     def validate(self) -> None:
@@ -176,11 +187,10 @@ class SSRConfig:
 class StructuralLabelsConfig:
     """CVPR 2024 Learning with Structural Labels 설정."""
 
-    enabled: bool = True  # LSL structural target/loss 활성화
-    neighbors: int = 20  # reverse k-NN label 전파 이웃 수
-    # - reverse k-NN query 분할 수; 메모리 조절용
-    knn_chunks: int = 10
-    loss_weight: float = 1.0  # structural mixup CE 가중치
+    enabled: bool = True  # LSL 사용
+    neighbors: int = 20  # reverse k-NN 이웃 수
+    knn_chunks: int = 10  # query 분할 수
+    loss_weight: float = 1.0  # structural loss 가중치
 
     def validate(self) -> None:
         if self.neighbors < 1:
@@ -199,15 +209,10 @@ class StructuralLabelsConfig:
 class LabelWaveConfig:
     """ICLR 2024 Label Wave checkpoint 선택 설정."""
 
-    enabled: bool = True  # prediction change 추적 + label_wave.pt 저장
-    # - False: checkpoint 저장 + 전체 epoch 학습
-    # - True: checkpoint 저장 + 조기 종료
-    stop_training: bool = False
-    # - prediction-change 이동평균 window
-    # - 시작값 3: 논문 Appendix E 참고
-    moving_average_window: int = 3
-    # - patience: 개선 없는 연속 횟수; 실험 설정값
-    patience: int = 20
+    enabled: bool = True  # GT 없이 Label Wave 저장
+    stop_training: bool = False  # True: 조기 종료
+    moving_average_window: int = 3  # PC 이동평균 길이
+    patience: int = 20  # 연속 미개선 허용 횟수
 
     def validate(self, training_epochs: int) -> None:
         if self.moving_average_window < 1:
@@ -228,29 +233,23 @@ class LabelWaveConfig:
 class TrainingConfig:
     """일반 이미지 데이터셋 학습 설정."""
 
-    epochs: int = 200  # 학습 epoch 수; 별도 warm-up 없음
-    batch_size: int = 512  # 학습 mini-batch; mixup forward 크기=1024
-    eval_batch_size: int = 1024  # feature 추출·validation·test 배치; FP32 유지
-    amp: bool = True  # CUDA 학습 forward: BF16; CPU/MPS: 미적용
-    channels_last: bool = True  # CUDA encoder·이미지 메모리 배치 최적화
-    fused_optimizer: bool = True  # CUDA AdamW fused kernel; 나머지 환경 미적용
-    learning_rate: float = 1e-3  # classifier/projector/predictor 초기 LR
-    # - encoder 전용 초기 LR
-    # - None: head와 같은 learning_rate
-    encoder_learning_rate: float | None = 3e-5
+    epochs: int = 300  # 학습·cosine 길이
+    batch_size: int = 256  # 학습; mixup 입력은 2배
+    eval_batch_size: int = 1024  # FP32 평가
+    amp: bool = True  # CUDA 학습 BF16
+    channels_last: bool = True  # CUDA 메모리 배치
+    fused_optimizer: bool = True  # CUDA fused AdamW
+    learning_rate: float = 1e-3  # head 초기 LR
+    encoder_learning_rate: float | None = 3e-5  # encoder LR; None: head와 동일
     optimizer: OptimizerName = "adamw"  # adamw / sgd
     momentum: float = 0.9  # SGD momentum
     weight_decay: float = 0.1  # weight decay
-    # - cosine 최저 LR / 각 parameter group 초기 LR
-    scheduler_eta_min_ratio: float = 1e-3
-    num_workers: int = 8  # 학습 loader당 worker 수; 두 loader 합계 16개
-    eval_num_workers: int = 8  # feature 추출·validation·test worker 수
-    # - worker당 미리 준비할 batch 수; workers=0이면 미사용
-    # - RAM 200 GB 활용; 두 학습 loader에 각각 최대 32 batch 준비
-    prefetch_factor: int = 4
-    # - epoch 간 worker 유지; selected loader는 매 epoch 재생성
-    persistent_workers: bool = True
-    log_interval: int = 20  # loss 진행 표시 갱신 간격; step 단위
+    scheduler_eta_min_ratio: float = 1e-3  # 최저 LR / 초기 LR
+    num_workers: int = 16  # 학습 loader당 worker; 동시 32개
+    eval_num_workers: int = 32  # feature 추출·평가 worker
+    prefetch_factor: int = 2  # worker당 선행 batch
+    persistent_workers: bool = True  # all-sample worker 유지
+    log_interval: int = 20  # 진행 표시 step 간격
 
     def validate(self) -> None:
         if self.epochs < 1:
@@ -288,12 +287,9 @@ class RuntimeConfig:
     """실행·저장 설정."""
 
     device: str = "auto"  # auto: CUDA → MPS → CPU
-    # - False: cuDNN autotune 활성화; 속도 우선
-    # - True: cuDNN deterministic, autotune 해제; 완전한 재현성 보장은 아님
-    # - 두 모드 모두 seed=0 유지; AMP 결과는 기존 FP32와 차이 가능
-    deterministic: bool = False
-    output_root: Path = field(default_factory=lambda: PROJECT_ROOT / "outputs")  # 결과 저장 루트
-    run_id: str | None = None  # None: 실행 시각 ID; 중복 지정 ID 거부
+    deterministic: bool = False  # False: cuDNN autotune
+    output_root: Path = field(default_factory=lambda: OUTPUT_ROOT)  # 결과 루트
+    run_id: str | None = None  # None: 새 실행 시각 ID
 
     def validate(self) -> None:
         if not self.output_root.is_absolute():

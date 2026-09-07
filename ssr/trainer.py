@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
+from time import perf_counter
 
 import torch
 from torch import Tensor
@@ -14,7 +15,7 @@ from tqdm import tqdm
 from lsl import structural_mixup_loss
 from setting.config import ExperimentConfig
 from setting.model import SSRNetworks
-from setting.precision import PrecisionPolicy, full_precision
+from setting.precision import PrecisionPolicy
 from ssr.losses import (
     mixup_hard_label_views,
     negative_cosine_similarity,
@@ -41,6 +42,10 @@ class TrainingLosses:
     supervised_loss: float
     feature_consistency_loss: float
     structural_loss: float | None
+    # Host-side next(loader) time, not an exact measure of CUDA idle time.
+    all_data_wait_seconds: float = field(default=0.0, compare=False)
+    selected_data_wait_seconds: float = field(default=0.0, compare=False)
+    max_batch_data_wait_seconds: float = field(default=0.0, compare=False)
 
 
 def _loss_value(loss: Tensor, name: str) -> float:
@@ -68,15 +73,29 @@ def train_epoch(
     supervised_average = _RunningAverage()
     consistency_average = _RunningAverage()
     structural_average = _RunningAverage() if structural_targets is not None else None
+    started = perf_counter()
     selected_iterator = iter(selected_loader)
-    progress = tqdm(all_samples_loader, desc=f"Train {epoch + 1}", leave=False)
+    selected_wait = perf_counter() - started
+    started = perf_counter()
+    all_iterator = iter(all_samples_loader)
+    all_wait = perf_counter() - started
+    max_wait = 0.0
+    progress = tqdm(range(1, len(all_samples_loader) + 1), desc=f"Train {epoch + 1}", leave=False)
 
-    for step, (all_views, all_indices) in enumerate(progress, start=1):
+    for step in progress:
+        started = perf_counter()
+        all_views, all_indices = next(all_iterator)
+        batch_all_wait = perf_counter() - started
+        all_wait += batch_all_wait
+        started = perf_counter()
         try:
             selected_views, selected_indices = next(selected_iterator)
         except StopIteration:
             selected_iterator = iter(selected_loader)
             selected_views, selected_indices = next(selected_iterator)
+        batch_selected_wait = perf_counter() - started
+        selected_wait += batch_selected_wait
+        max_wait = max(max_wait, batch_all_wait + batch_selected_wait)
 
         # Release the previous step's gradients before allocating activations.
         optimizer.zero_grad(set_to_none=True)
@@ -176,37 +195,7 @@ def train_epoch(
         structural_loss=(
             structural_average.value if structural_average is not None else None
         ),
+        all_data_wait_seconds=all_wait,
+        selected_data_wait_seconds=selected_wait,
+        max_batch_data_wait_seconds=max_wait,
     )
-
-
-@torch.no_grad()
-def test_accuracy(
-    loader: DataLoader,
-    networks: SSRNetworks,
-    device: torch.device,
-    *,
-    description: str = "Evaluation",
-    channels_last: bool = False,
-) -> float:
-    networks.eval()
-    device = torch.device(device)
-    precision = PrecisionPolicy(
-        device=device, channels_last=channels_last and device.type == "cuda"
-    )
-    correct = torch.zeros((), dtype=torch.long, device=device)
-    samples = 0
-    for images, labels in tqdm(loader, desc=description, leave=False):
-        images = precision.to_device(images)
-        if images.dtype in {torch.float16, torch.bfloat16}:
-            images = images.float()
-        labels = labels.to(device, non_blocking=True)
-        with full_precision(device):
-            logits = networks.classifier(networks.encoder(images))
-        if not torch.isfinite(logits).all().item():
-            raise FloatingPointError(f"{description} model produced non-finite logits.")
-        predictions = logits.argmax(dim=1)
-        correct += predictions.eq(labels).sum()
-        samples += images.size(0)
-    if samples == 0:
-        raise RuntimeError(f"{description} loader is empty.")
-    return float((correct / samples).item())

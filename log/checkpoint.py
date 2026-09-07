@@ -13,6 +13,15 @@ from setting.config import ExperimentConfig
 from setting.model import SSRNetworks
 
 
+SELECTION_METRICS = ("balanced_accuracy", "macro_f1")
+CHECKPOINT_FILENAMES = (
+    "best_balanced_accuracy.pt",
+    "best_macro_f1.pt",
+    "last.pt",
+    "label_wave.pt",
+)
+
+
 class CheckpointManager:
     """Persist consistently structured checkpoints for one training run."""
 
@@ -27,20 +36,23 @@ class CheckpointManager:
         self.networks = networks
         self.optimizer = optimizer
         self.config = config
+        self.records: dict[str, dict[str, Any]] = {}
 
     def save(
         self,
         filename: str,
         epoch: int,
         *,
-        test_accuracy: float | None = None,
-        metrics: Mapping[str, float | None] | None = None,
+        metrics: Mapping[str, Any] | None = None,
         label_wave: Mapping[str, Any] | None = None,
+        selection: Mapping[str, Any] | None = None,
     ) -> None:
         if Path(filename).name != filename:
             raise ValueError("checkpoint filename must not contain a directory.")
         state: dict[str, Any] = {
             "cur_epoch": epoch,
+            "completed_epochs": epoch + 1,
+            "metric_units": "rates in [0, 1]; loss/entropy in nats; MCC/kappa in [-1, 1]",
             "model_name": self.config.model.name,
             "model_config": asdict(self.config.model),
             "class_names": list(self.config.data.class_names),
@@ -50,6 +62,8 @@ class CheckpointManager:
                 "mean": list(self.config.data.mean),
                 "std": list(self.config.data.std),
                 "label_offset": self.config.data.label_offset,
+                "crop_bbox": self.config.data.crop_bbox,
+                "missing_bbox": self.config.data.missing_bbox,
             },
             "structural_labels_enabled": self.config.structural_labels.enabled,
             "classifier": self.networks.classifier.state_dict(),
@@ -60,8 +74,16 @@ class CheckpointManager:
         }
         if label_wave is not None:
             state["label_wave"] = dict(label_wave)
-        if test_accuracy is not None:
-            state["test_accuracy"] = test_accuracy
         if metrics is not None:
             state["metrics"] = dict(metrics)
+        if selection is not None:
+            state["selection"] = dict(selection)
         atomic_torch_save(state, self.run_dir / filename)
+        self.records[filename] = {
+            "filename": filename,
+            "epoch": epoch,
+            "completed_epochs": epoch + 1,
+            "validation": dict(metrics or {}).get("validation"),
+            "selection": dict(selection or {}),
+            "label_wave": dict(label_wave) if label_wave is not None else None,
+        }

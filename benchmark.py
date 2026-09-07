@@ -26,7 +26,7 @@ from ssr.trainer import train_epoch
 # - H100 후보 비교; config의 batch_size는 변경하지 않음
 BATCH_SIZES = (256, 512, 1024)
 WARMUP_STEPS = 3  # worker 시작 / kernel 준비; 시간 측정 제외
-# - 기본 prefetch 대기열(8 workers × 4 batch)보다 긴 구간 측정
+# - 기본 prefetch 대기열(16 workers × 2 batch)보다 긴 구간 측정
 # - worker/prefetch 증가 시 함께 확대; 데이터 읽기·증강·학습 시간 포함
 TIMED_STEPS = 40
 _RESULT_PREFIX = "BENCHMARK_RESULT "

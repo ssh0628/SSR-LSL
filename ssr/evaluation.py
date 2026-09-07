@@ -197,6 +197,11 @@ def selection_metrics(
     return {
         "selected": int(selected.numel()),
         "rejected": int(rejected.numel()),
+        "selected_rate": float(selected.numel() / noisy_labels.numel()),
+        "observed_class_counts": torch.bincount(noisy_labels, minlength=num_classes).tolist(),
+        "modified_class_counts": torch.bincount(modified, minlength=num_classes).tolist(),
+        "selected_class_counts": torch.bincount(modified[selected], minlength=num_classes).tolist(),
+        "rejected_class_counts": torch.bincount(modified[rejected], minlength=num_classes).tolist(),
         "relabel_candidates": int(relabelled.numel()),
         # Kept for compatibility with existing result sheets/log parsers.
         "relabelled": int(relabelled.numel()),

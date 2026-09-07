@@ -28,4 +28,7 @@ htmlcov/
 # Local datasets and experiment artifacts
 data/
 outputs/
+# Legacy pixel caches; no longer generated
+image_cache/
+*.log
 tests

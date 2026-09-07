@@ -1,4 +1,4 @@
-"""Full-image transforms and independent SSR/LSL training views."""
+"""Image transforms and independent SSR/LSL training views."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Callable
 from PIL import Image
 from torch import Tensor
 from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 
 from setting.config import AugmentationConfig, DataConfig
 
@@ -55,15 +54,12 @@ class AllSampleViews:
 
 
 def build_image_transforms(data: DataConfig, config: AugmentationConfig) -> ImageTransforms:
-    resize = transforms.Resize(
-        (data.image_size, data.image_size), interpolation=InterpolationMode.BICUBIC
-    )
+    """Augment images already cropped and resized once by the dataset."""
     to_tensor = transforms.ToTensor()
     normalize = transforms.Normalize(data.mean, data.std)
 
     def augmented(rotation: float, *, color: bool) -> ImageTransform:
         operations = [
-            resize,
             transforms.RandomHorizontalFlip(config.horizontal_flip),
             transforms.RandomVerticalFlip(config.vertical_flip),
             transforms.RandomRotation(rotation),
@@ -73,7 +69,7 @@ def build_image_transforms(data: DataConfig, config: AugmentationConfig) -> Imag
         return transforms.Compose([*operations, to_tensor, normalize])
 
     return ImageTransforms(
-        evaluation=transforms.Compose([resize, to_tensor, normalize]),
+        evaluation=transforms.Compose([to_tensor, normalize]),
         weak=augmented(config.weak_rotation, color=False),
         strong=augmented(config.strong_rotation, color=True),
     )

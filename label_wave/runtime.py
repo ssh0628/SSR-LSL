@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Mapping
 
 from torch import Tensor
 
@@ -47,6 +48,7 @@ class LabelWaveRun:
         *,
         completed_epochs: int,
         validation_accuracy: float | None = None,
+        validation_metrics: Mapping[str, Any] | None = None,
     ) -> LabelWaveObservation:
         if self._writer is None:
             raise RuntimeError("LabelWaveRun must be used as a context manager.")
@@ -54,6 +56,7 @@ class LabelWaveRun:
         observation = self.tracker.update(predictions, epoch=completed_epochs)
         values = asdict(observation)
         values["validation_accuracy"] = validation_accuracy
+        values["validation"] = dict(validation_metrics) if validation_metrics is not None else None
         self._writer.write(values)
 
         if observation.is_candidate:
@@ -61,7 +64,11 @@ class LabelWaveRun:
                 "label_wave.pt",
                 completed_epochs - 1,
                 label_wave=asdict(observation),
-                metrics={"validation_accuracy": validation_accuracy},
+                metrics={
+                    "validation_accuracy": validation_accuracy,
+                    "validation": dict(validation_metrics) if validation_metrics is not None else None,
+                },
+                selection={"method": "label_wave", "criterion": "prediction_change"},
             )
             print(
                 f"label_wave candidate_epoch={completed_epochs} "

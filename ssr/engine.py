@@ -17,16 +17,18 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 
 from label_wave import LabelWaveRun
-from log.checkpoint import CheckpointManager
+from log.checkpoint import SELECTION_METRICS, CheckpointManager
 from log.common import JsonlWriter, write_config
 from setting.config import ExperimentConfig
 from setting.data import ExperimentData, build_experiment_data
 from setting.model import SSRNetworks, build_ssr_networks, calibrate_batch_norm
 from setting.precision import PrecisionPolicy, full_precision
 from ssr.evaluation import evaluate_epoch, predict_training_labels, selection_metrics
+from ssr.checkpoint_evaluation import evaluate_checkpoints
+from ssr.metrics import evaluate_classification, metrics_from_confusion_matrix
 from ssr.sampler import ClassBalancedSampler
 from ssr.selection import SelectionResult
-from ssr.trainer import test_accuracy, train_epoch
+from ssr.trainer import train_epoch
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,9 +306,11 @@ def run(config: ExperimentConfig) -> float | None:
         f"workers={config.training.num_workers} eval_workers={config.training.eval_num_workers}"
     )
     if loaders.validation is None:
-        print("validation=disabled; best.pt omitted; last.pt saved every epoch.")
+        print("validation=disabled; best checkpoints omitted; last.pt saved every epoch.")
     best_accuracy: float | None = None
-    last_accuracy: float | None = None
+    best_scores: dict[str, float | None] = {metric: None for metric in SELECTION_METRICS}
+    best_epochs: dict[str, int | None] = {metric: None for metric in SELECTION_METRICS}
+    last_validation: dict[str, Any] | None = None
     last_completed_epoch = -1
     stopped_by_label_wave = False
     label_wave = (
@@ -322,6 +326,7 @@ def run(config: ExperimentConfig) -> float | None:
         if label_wave is not None:
             stack.enter_context(label_wave)
         for epoch in range(config.training.epochs):
+            epoch_started = _timestamp(device)
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             selection_started = _timestamp(device)
@@ -337,10 +342,12 @@ def run(config: ExperimentConfig) -> float | None:
                 observation = label_wave.observe(
                     supervision.predictions,
                     completed_epochs=epoch,
-                    validation_accuracy=last_accuracy,
+                    validation_accuracy=last_validation["accuracy"] if last_validation else None,
+                    validation_metrics=last_validation,
                 )
                 if observation.should_stop and config.label_wave.stop_training:
                     stopped_by_label_wave = True
+                    del supervision
                     break
 
             training_started = _timestamp(device)
@@ -370,13 +377,14 @@ def run(config: ExperimentConfig) -> float | None:
             )
             scheduler.step()
             last_completed_epoch = epoch
-            current_accuracy = None
+            validation = None
             validation_started = _timestamp(device)
             try:
                 if loaders.validation is not None:
-                    current_accuracy = test_accuracy(
+                    validation = evaluate_classification(
                         loaders.validation, networks, device, description="Validation",
                         channels_last=config.training.channels_last,
+                        class_names=data.class_names,
                     )
             finally:
                 validation_seconds = _timestamp(device) - validation_started
@@ -385,26 +393,62 @@ def run(config: ExperimentConfig) -> float | None:
                 checkpoints.save(
                     "last.pt",
                     epoch,
-                    metrics={"validation_accuracy": current_accuracy},
+                    metrics={
+                        "validation_accuracy": validation["accuracy"] if validation else None,
+                        "validation": validation,
+                    },
+                    selection={"method": "last", "criterion": "last_epoch"},
                 )
-            last_accuracy = current_accuracy
-
-            is_best = current_accuracy is not None and (
-                best_accuracy is None or current_accuracy > best_accuracy
+            last_validation = validation
+            current_accuracy = validation["accuracy"] if validation else None
+            if current_accuracy is not None:
+                best_accuracy = max(best_accuracy if best_accuracy is not None else -1.0, current_accuracy)
+                for metric in SELECTION_METRICS:
+                    score = validation[metric]
+                    if best_scores[metric] is None or score > best_scores[metric]:
+                        best_scores[metric], best_epochs[metric] = score, epoch + 1
+                        checkpoints.save(
+                            f"best_{metric}.pt", epoch,
+                            metrics={"validation_accuracy": current_accuracy, "validation": validation},
+                            selection={"method": "best", "split": "validation", "criterion": metric, "score": score},
+                        )
+            # These are comparisons to provided noisy labels, NOT clean accuracy.
+            prediction_counts = torch.bincount(
+                supervision.predictions, minlength=data.num_classes,
             )
-            if is_best:
-                best_accuracy = current_accuracy
+            observed_confusion = torch.bincount(
+                noisy_labels * data.num_classes + supervision.predictions,
+                minlength=data.num_classes**2,
+            ).reshape(data.num_classes, data.num_classes)
+            observed_metrics = metrics_from_confusion_matrix(observed_confusion, class_names=data.class_names)
             values = {
                 "epoch": epoch,
+                "completed_epochs": epoch + 1,
+                "metric_units": "rates in [0, 1]",
                 "learning_rate": learning_rate,
                 "encoder_learning_rate": encoder_learning_rate,
                 **asdict(losses),
                 "validation_accuracy": current_accuracy,
+                "validation_balanced_accuracy": validation["balanced_accuracy"] if validation else None,
+                "validation_macro_f1": validation["macro_f1"] if validation else None,
+                "validation": validation,
                 "best_validation_accuracy": best_accuracy,
                 "best_accuracy": best_accuracy,
+                "best_validation_balanced_accuracy": best_scores["balanced_accuracy"],
+                "best_validation_macro_f1": best_scores["macro_f1"],
+                "best_epochs": dict(best_epochs),
+                "train_observed_label_metrics_before_update": observed_metrics,
+                "prediction_class_counts": prediction_counts.tolist(),
+                "prediction_dominant_class_fraction": float(prediction_counts.max().item() / training_samples),
+                "total_loss": (
+                    losses.supervised_loss
+                    + config.ssr.feature_consistency_weight * losses.feature_consistency_loss
+                    + config.structural_labels.loss_weight * (losses.structural_loss or 0.0)
+                ),
                 "selection_seconds": selection_seconds,
                 "training_seconds": training_seconds,
                 "validation_seconds": validation_seconds,
+                "epoch_seconds": _timestamp(device) - epoch_started,
                 "train_steps": train_steps,
                 "train_samples_per_second": samples_per_second,
                 "cuda_peak_allocated_gib": (
@@ -423,7 +467,11 @@ def run(config: ExperimentConfig) -> float | None:
             }
             metrics_writer.write(values)
             accuracy_summary = (
-                f"validation_accuracy={current_accuracy:.4f} best={best_accuracy:.4f}"
+                f"val_acc={current_accuracy:.2%} "
+                f"val_bal_acc={validation['balanced_accuracy']:.2%} "
+                f"val_macro_f1={validation['macro_f1']:.2%} "
+                f"best_bal_acc={best_scores['balanced_accuracy']:.2%} "
+                f"best_macro_f1={best_scores['macro_f1']:.2%}"
                 if current_accuracy is not None and best_accuracy is not None
                 else "validation_accuracy=unavailable"
             )
@@ -434,15 +482,11 @@ def run(config: ExperimentConfig) -> float | None:
                 f"label_changes={values['label_changes']} "
                 f"{accuracy_summary} "
                 f"selection_s={selection_seconds:.1f} train_s={training_seconds:.1f} "
-                f"train_samples/s={samples_per_second:.1f}"
+                f"train_samples/s={samples_per_second:.1f} "
+                f"data_wait_s={losses.all_data_wait_seconds + losses.selected_data_wait_seconds:.1f}",
+                flush=True,
             )
-
-            if is_best:
-                checkpoints.save(
-                    "best.pt",
-                    epoch,
-                    metrics={"validation_accuracy": current_accuracy},
-                )
+            del supervision, selected_loader
 
         if label_wave is not None and not stopped_by_label_wave:
             final_predictions = predict_training_labels(
@@ -454,22 +498,13 @@ def run(config: ExperimentConfig) -> float | None:
             label_wave.observe(
                 final_predictions,
                 completed_epochs=last_completed_epoch + 1,
-                validation_accuracy=last_accuracy,
+                validation_accuracy=last_validation["accuracy"] if last_validation else None,
+                validation_metrics=last_validation,
             )
 
-    if loaders.test is not None:
-        final_test_accuracy = test_accuracy(
-            loaders.test, networks, device, description="Test",
-            channels_last=config.training.channels_last,
-        )
-        print(f"final_test_accuracy={final_test_accuracy:.4f} (last checkpoint)")
-        checkpoints.save(
-            "last.pt",
-            last_completed_epoch,
-            test_accuracy=final_test_accuracy,
-            metrics={
-                "validation_accuracy": last_accuracy,
-                "test_accuracy": final_test_accuracy,
-            },
-        )
+    evaluate_checkpoints(
+        checkpoints, networks, loaders.test, device,
+        channels_last=config.training.channels_last, class_names=data.class_names,
+        evaluator=evaluate_classification,
+    )
     return best_accuracy

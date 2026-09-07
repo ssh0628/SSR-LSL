@@ -90,7 +90,7 @@ def verify_image_files(
     if report_path is not None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
     output = (
-        report_path.open("w", encoding="utf-8") if report_path else nullcontext(None)
+        report_path.open("a", encoding="utf-8") if report_path else nullcontext(None)
     )
     summary = {"checked": 0, "recovered": 0, "failed": 0}
     failure_examples: list[str] = []
