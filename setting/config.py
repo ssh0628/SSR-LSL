@@ -13,13 +13,14 @@ import torch
 
 # - 경로: 아래 값 직접 수정
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # 프로젝트
-DATASET_ROOT = Path("/root/project/dataset/npy_path/modify_npy")  # 기존 NPY·bbox 입력
+DATASET_ROOT = Path("/root/project/dataset/npy_path/consensus/sqrt/modify_same_as_orig")  # multi_roi sqrt NPY
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"  # 학습 결과
 
 # - H100 NVL: batch 256/1024, workers 16×2/32, prefetch 2; train 512 OOM
 # - RTX 5080: train 16 / eval 64 / prefetch 1; 시작값
 OptimizerName = Literal["sgd", "adamw"]
 MissingBBoxPolicy = Literal["drop", "error", "full"]
+ROICropMethod = Literal["roi_resize", "aspect_letterbox"]
 
 
 def validate_missing_bbox(policy: str) -> None:
@@ -49,7 +50,7 @@ class DataConfig:
     root: Path = field(default_factory=lambda: DATASET_ROOT)  # NPY 루트
     image_root: Path | None = None  # 상대 이미지 경로 기준; None: root
     annotation_root: Path | None = None  # JSON 루트; None: 이미지 옆
-    name: str = "a1-a7"  # 실험 이름
+    name: str = "a1-a7-multi-roi-sqrt"  # 실험 이름
     class_names: tuple[str, ...] = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")  # 라벨 순서
     train: SplitConfig = field(
         default_factory=lambda: SplitConfig("train_path.npy", "train_labels.npy")
@@ -62,9 +63,13 @@ class DataConfig:
     )  # None: test 생략
     label_offset: int = 0  # 라벨 시작 번호
     crop_bbox: bool = True  # 전체 이미지에서 bbox crop
+    multi_roi: bool = True  # 학습: 27개 scale·방향 중 1개
+    crop_method: ROICropMethod = "aspect_letterbox"  # 비율 유지·패딩 / roi_resize: 정사각 변형
+    roi_scales: tuple[float, ...] = (0.8, 1.0, 1.2)  # bbox 크기 배율
+    roi_shift_ratio: float = 0.15  # 방향별 이동 상한; crop 크기 기준
     missing_bbox: MissingBBoxPolicy = "drop"  # 누락: 제외 / 중단 / 전체 이미지
     image_size: int = 224  # crop 후 resize
-    bbox_workers: int = 16  # bbox JSON 확인 worker
+    bbox_workers: int = 16  # bbox JSON·이미지 크기 확인 worker
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # 정규화 평균
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # 정규화 표준편차
     allow_truncated_images: bool = True  # 잘린 이미지 재시도
@@ -85,6 +90,14 @@ class DataConfig:
         if self.annotation_root is not None and not self.annotation_root.is_absolute():
             raise ValueError("data.annotation_root must be an absolute path.")
         validate_missing_bbox(self.missing_bbox)
+        if self.multi_roi and not self.crop_bbox:
+            raise ValueError("data.multi_roi requires data.crop_bbox=True.")
+        if self.crop_method not in get_args(ROICropMethod):
+            raise ValueError(f"data.crop_method must be one of {get_args(ROICropMethod)}.")
+        if not self.roi_scales or any(not isfinite(v) or v <= 0 for v in self.roi_scales):
+            raise ValueError("data.roi_scales must contain positive finite scales.")
+        if not isfinite(self.roi_shift_ratio) or not 0 <= self.roi_shift_ratio <= 1:
+            raise ValueError("data.roi_shift_ratio must be in [0, 1].")
         if (
             not self.name
             or not self.name.isascii()

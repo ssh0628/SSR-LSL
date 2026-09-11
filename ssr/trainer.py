@@ -70,6 +70,8 @@ def train_epoch(
     training = getattr(config, "training", None)
     precision = PrecisionPolicy.from_config(training, device)
     log_interval = getattr(training, "log_interval", 20)
+    total_steps = len(all_samples_loader)
+    expected_views = 3 if structural_targets is not None else 2
     supervised_average = _RunningAverage()
     consistency_average = _RunningAverage()
     structural_average = _RunningAverage() if structural_targets is not None else None
@@ -80,7 +82,7 @@ def train_epoch(
     all_iterator = iter(all_samples_loader)
     all_wait = perf_counter() - started
     max_wait = 0.0
-    progress = tqdm(range(1, len(all_samples_loader) + 1), desc=f"Train {epoch + 1}", leave=False)
+    progress = tqdm(range(1, total_steps + 1), desc=f"Train {epoch + 1}", leave=False, disable=None)
 
     for step in progress:
         started = perf_counter()
@@ -96,6 +98,12 @@ def train_epoch(
         batch_selected_wait = perf_counter() - started
         selected_wait += batch_selected_wait
         max_wait = max(max_wait, batch_all_wait + batch_selected_wait)
+
+        # Reject malformed view batches before any parameter/BN state changes.
+        if len(all_views) != expected_views:
+            if structural_targets is not None:
+                raise RuntimeError("LSL requires [weak, strong, strong] all-sample views.")
+            raise RuntimeError("SSR requires [weak, strong] all-sample views.")
 
         # Release the previous step's gradients before allocating activations.
         optimizer.zero_grad(set_to_none=True)
@@ -147,8 +155,6 @@ def train_epoch(
         del weak_view
 
         if structural_targets is not None:
-            if len(all_views) != 3:
-                raise RuntimeError("LSL requires [weak, strong, strong] all-sample views.")
             second_strong_view = precision.to_device(all_views[2])
             batch_structural_targets = structural_targets[all_indices.to(device)]
             with precision.autocast():
@@ -164,27 +170,16 @@ def train_epoch(
             (config.structural_labels.loss_weight * current_structural_loss).backward()
             structural_average.update(structural_value)
             del current_structural_loss, batch_structural_targets, second_strong_view
-        elif len(all_views) != 2:
-            raise RuntimeError("SSR requires [weak, strong] all-sample views.")
 
         optimizer.step()
         del first_strong_view
 
-        if step % log_interval != 0 and step != len(all_samples_loader):
+        if progress.disable or (step % log_interval != 0 and step != total_steps):
             continue
-        encoder_learning_rate = optimizer.param_groups[0]["lr"]
-        head_learning_rate = (
-            optimizer.param_groups[1]["lr"]
-            if len(optimizer.param_groups) > 1
-            else encoder_learning_rate
-        )
         postfix = {
-            "lr": f"{head_learning_rate:.6f}",
             "ce": f"{supervised_average.value:.4f}",
             "fc": f"{consistency_average.value:.4f}",
         }
-        if encoder_learning_rate != head_learning_rate:
-            postfix["enc_lr"] = f"{encoder_learning_rate:.6f}"
         if structural_average is not None:
             postfix["st"] = f"{structural_average.value:.4f}"
         progress.set_postfix(**postfix)

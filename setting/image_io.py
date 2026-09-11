@@ -107,7 +107,7 @@ def verify_image_files(
             _bounded_checks(executor, tasks, min(workers, count))
             if executor else map(_check_image, tasks)
         )
-        for result in tqdm(results, total=count, desc="Check images", unit="img"):
+        for result in tqdm(results, total=count, desc="Check images", unit="img", disable=None):
             summary["checked"] += 1
             if result.status == "ok":
                 continue

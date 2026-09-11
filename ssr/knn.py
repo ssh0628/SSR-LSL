@@ -31,8 +31,12 @@ def hard_knn_scores(
     feature_labels: Tensor,
     num_classes: int,
     neighbors: int,
+    *,
+    chunks: int = 1,
 ) -> Tensor:
     """Uniformly vote over the cosine-nearest labels, including self matches."""
+    if chunks < 1:
+        raise ValueError("chunks must be positive.")
     scores = torch.zeros(
         queries.size(0),
         num_classes,
@@ -40,7 +44,7 @@ def hard_knn_scores(
         dtype=queries.dtype,
     )
     chunk_size = similarity_chunk_size(
-        len(queries), feature_bank_transposed.size(1), queries.element_size(), chunks=1
+        len(queries), feature_bank_transposed.size(1), queries.element_size(), chunks
     )
     for start in range(0, len(queries), chunk_size):
         end = min(start + chunk_size, len(queries))
@@ -90,29 +94,15 @@ def balanced_knn_scores(
         if current_features is feature_bank
         else F.normalize(current_features, dim=1)
     )
-    feature_bank_transposed = normalized_bank.T
-    chunk_size = similarity_chunk_size(
-        len(normalized_queries),
-        len(normalized_bank),
-        normalized_bank.element_size(),
-        chunks,
-    )
-    score_parts: list[Tensor] = []
-
-    for start in range(0, len(normalized_queries), chunk_size):
-        end = min(start + chunk_size, len(normalized_queries))
-        score_parts.append(
-            hard_knn_scores(
-                normalized_queries[start:end],
-                feature_bank_transposed,
-                labels,
-                num_classes,
-                neighbors,
-            )
-        )
-
-    if not score_parts:
+    if len(normalized_queries) == 0:
         return torch.empty((0, num_classes), device=feature_bank.device)
-    scores = torch.cat(score_parts, dim=0)
+    scores = hard_knn_scores(
+        normalized_queries,
+        normalized_bank.T,
+        labels,
+        num_classes,
+        neighbors,
+        chunks=chunks,
+    )
     scores = scores / class_prior
     return scores / scores.sum(dim=1, keepdim=True)

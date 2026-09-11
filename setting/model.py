@@ -100,7 +100,7 @@ def calibrate_batch_norm(
             module.reset_running_stats()
             # Cumulative average uses every calibration batch equally.
             module.momentum = None
-        for images, _ in tqdm(loader, desc="BN calibration", leave=False):
+        for images, _ in tqdm(loader, desc="BN calibration", leave=False, disable=None):
             encoder(images.to(device, non_blocking=True))
             batches += 1
     finally:

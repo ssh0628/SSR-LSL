@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Iterable
 from zipfile import BadZipFile
 
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
 from setting.config import validate_missing_bbox
@@ -175,7 +176,6 @@ def _audit_missing(
                 "status": "bbox_summary", "split": name, "checked": len(boxes),
                 "with_bbox": len(boxes) - missing, "missing": missing, "policy": policy,
             }) + "\n")
-    print(f"[{name}] Bboxes: {len(boxes) - missing}/{len(boxes)}; missing={missing}.")
     if missing and policy == "error":
         examples = list(islice((paths[i] for i, box in enumerate(boxes) if box is None), 5))
         raise RuntimeError(
@@ -183,9 +183,7 @@ def _audit_missing(
             + "\n".join(examples)
             + (f"\nFull report: {report_path}" if report_path else "")
         )
-    if missing and policy == "drop":
-        print(f"[{name}] Excluding {missing} missing bbox(es) from the dataset (missing_bbox='drop').")
-    elif missing:
+    if missing and policy == "full":
         print(f"WARNING [{name}]: using full images for {missing} missing bbox(es) (missing_bbox='full').")
 
 
@@ -248,7 +246,7 @@ def prepare_bboxes(
     with output as report, ThreadPoolExecutor(max_workers=workers) as executor:
         pending = iter(indices)
         action = "Repair" if cached_boxes is not None else "Cache"
-        with tqdm(total=len(indices), desc=f"{action} {name} bboxes", unit="img") as progress:
+        with tqdm(total=len(indices), desc=f"{action} {name} bboxes", unit="img", disable=None) as progress:
             while batch := list(islice(pending, workers * 32)):
                 tasks = ((config, paths[index]) for index in batch)
                 for index, (box, status, error) in zip(batch, executor.map(_read_annotation, tasks)):
@@ -279,7 +277,6 @@ def prepare_bboxes(
     if cached_boxes is None:
         _audit_missing(boxes, paths, name, config.missing_bbox, report_path)
         _save_cache(path, originals, boxes)
-        print(f"[{name}] Saved bbox cache: {path}")
     else:
         if recovered:
             _save_cache(path, originals, boxes)
@@ -295,7 +292,6 @@ def prepare_bboxes(
                     "checked": len(indices), "recovered": len(recovered),
                     "missing": len(indices) - len(recovered),
                 }) + "\n")
-        print(f"[{name}] Recovered {len(recovered)}/{len(indices)} missing bbox(es) from JSON.")
         _audit_missing(boxes, paths, name, config.missing_bbox, report_path)
     return boxes
 
@@ -326,3 +322,52 @@ def clamp_bbox(bbox: BBox | None, image_width: int, image_height: int) -> BBox |
     x1, y1, x2, y2 = bbox
     clipped = max(0, x1), max(0, y1), min(image_width, x2), min(image_height, y2)
     return clipped if clipped[2] > clipped[0] and clipped[3] > clipped[1] else None
+
+
+def _clip_to_image(task: tuple[str, BBox | None]) -> BBox | None:
+    path, box = task
+    if box is None:
+        return None
+    try:
+        with Image.open(path) as image:
+            return clamp_bbox(box, *image.size)
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        raise RuntimeError(f"Failed to read image dimensions: {path}") from error
+
+
+def validate_crop_boxes(
+    paths: tuple[str, ...], boxes: tuple[BBox | None, ...], name: str,
+    *, workers: int, missing: str, report_path: Path | None,
+) -> tuple[BBox | None, ...]:
+    """Read native dimensions with bounded I/O; preserve order and rejection policy."""
+    if len(boxes) != len(paths):
+        raise ValueError(f"{name}: bbox count does not match image count.")
+    workers = max(1, min(workers, len(paths)))
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+    output = report_path.open("a", encoding="utf-8") if report_path else nullcontext(None)
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else nullcontext(None)
+    valid: list[BBox | None] = []
+    failures: list[str] = []
+    with output as report, pool as executor, tqdm(
+        total=len(paths), desc=f"Check {name} bbox bounds", unit="img", disable=None,
+    ) as progress:
+        pending = iter(zip(paths, boxes))
+        while batch := list(islice(pending, workers * 32)):
+            results = executor.map(_clip_to_image, batch) if executor else map(_clip_to_image, batch)
+            for (path, box), clipped in zip(batch, results):
+                index = len(valid)
+                if box is not None and (clipped is None or clipped != box):
+                    if report is not None:
+                        report.write(json.dumps({
+                            "split": name, "index": index, "path": path,
+                            "status": "bbox_clipped" if clipped else "bbox_outside_image",
+                            "bbox": box, "clipped_bbox": clipped,
+                        }, ensure_ascii=False) + "\n")
+                    if clipped is None and missing != "full" and len(failures) < 10:
+                        failures.append(f"{name}[{index}]: {path} bbox={box}")
+                valid.append(clipped)
+            progress.update(len(batch))
+    if failures:
+        raise ValueError("Bboxes outside source images:\n" + "\n".join(failures))
+    return tuple(valid)

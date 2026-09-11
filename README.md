@@ -6,9 +6,10 @@
 - seed: `0`
 - 기본값: pretrained ConvNeXtV2-Tiny, SSR + LSL, Label Wave 저장
 - SSR/LSL 수식·sample selection 유지
-- 입력: 원본 이미지 직접 읽기 → bbox crop → 224 resize → 증강
+- 기본 데이터: `multi_roi`의 consensus + sqrt NPY
+- 입력: 원본 이미지 → random Multi-ROI → aspect letterbox 224 → 증강
 - 이미지 픽셀 복제·대용량 RGB 캐시 생성 없음
-- multi-ROI offset·scale, 추가 noise, sqrt resampling 미사용
+- 추가 noise·중복 sqrt 다운샘플링 없음
 
 ## 구조
 
@@ -16,7 +17,7 @@
 run.py         bbox 준비 → 학습 → checkpoint 평가
 audit.py
 benchmark.py
-setting/       config, NPY loader, bbox 좌표·이미지 검사, augmentation, model 구성
+setting/       config, NPY loader, bbox, Multi-ROI·letterbox, augmentation, model 구성
 models/        backbone
 ssr/           relabel, k-NN selection, loss, 학습
 lsl/           reverse k-NN, structural loss
@@ -34,7 +35,7 @@ cifar/         기존 구조·실험 큐·설정 복사본
 `setting/config.py` 상단에서 경로 지정:
 
 ```python
-DATASET_ROOT = Path("/root/project/dataset/npy_path/modify_npy")
+DATASET_ROOT = Path("/root/project/dataset/npy_path/consensus/sqrt/modify_same_as_orig")
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"
 ```
 
@@ -47,6 +48,10 @@ validation = SplitConfig("val_path.npy", "val_labels.npy")
 test = SplitConfig("test_path.npy", "test_labels.npy")
 image_size = 224
 crop_bbox = True
+multi_roi = True
+crop_method = "aspect_letterbox"
+roi_scales = (0.8, 1.0, 1.2)
+roi_shift_ratio = 0.15
 ```
 
 - paths: 이미지 경로 문자열 NPY, shape `(N,)`
@@ -58,7 +63,33 @@ crop_bbox = True
 - 다른 파일명: `SplitConfig`에서 직접 지정
 - validation/test가 없으면 해당 필드를 `None`
 - `split_config.json`, `classes.json` 필수 아님
+- 메타데이터가 있으면 클래스 순서 확인·`data_audit.jsonl`에 기록
+- `use_sqrt` 누락: 중단하지 않음. NPY 재다운샘플링 없음
 - 클래스 수: `class_names`에서 자동 계산
+
+Sqrt 데이터셋:
+
+- 기본 경로: `multi_roi/ConvNeXt/training/total_run.py`의 NPY 경로
+- 원본·수정본의 동일 클래스·ID 매칭 후 sqrt 다운샘플링한 기존 split 사용
+- 기본 목표 수: 클래스별 `floor(sqrt(N_class × N_min))`; 중복 추출 없음
+- train·val·test: 각 NPY를 그대로 사용. 다시 split·다운샘플링하지 않음
+- 다른 sqrt NPY 사용: `DATASET_ROOT`만 변경
+- 기존 SSR의 전체 `modify_npy`와 평가 표본이 다를 수 있음. 직접 성능 비교 시 같은 split 필요
+- SSR selected-sample class-balanced sampler는 유지; dataset 다운샘플링과 별개
+
+Multi-ROI / aspect letterbox:
+
+- 학습: 샘플 접근마다 scale 3개 × 방향 9개 중 1개 균등 선택
+- scale: `0.8 / 1.0 / 1.2`; 방향: 중앙·상하좌우·대각선
+- 이동: 방향별 `0~0.15 × 해당 crop 너비/높이`
+- ROI는 원본 이미지에서 추출. 기존 bbox 바깥의 실제 배경 포함
+- 이미지 경계 밖: 검정 패딩. letterbox 여백: RGB `(124, 116, 104)`
+- 긴 변 224로 bicubic resize → 중앙 배치. ROI 종횡비 유지
+- 접근당 crop 1회 공유 → 기존 weak·strong 증강은 각각 독립
+- SSR 특징 추출·k-NN·LSL target·Label Wave: 고정 중앙 ROI
+- validation·최종 test: 고정 중앙 ROI. 27-view TTA 평균 아님
+- `multi_roi=False`: scale·offset만 비활성. letterbox 유지
+- 이전 단일-ROI 입력: `multi_roi=False`, `crop_method="roi_resize"`
 
 Bbox:
 
@@ -78,6 +109,7 @@ Bbox:
 - `missing_bbox="full"`: 누락 이미지만 전체 입력. 명시적 선택 시에만 허용
 - 잘못된 좌표·경로 설정, 이미지 밖 bbox, 제외 후 빈 split: 중단
 - 원본 크기로 좌표 clamp. 이미 유효한 cache의 JSON 좌표 수정 시 재생성 필요
+- 이미지 크기 확인: `bbox_workers`로 제한 병렬 처리. decode 없이 header만 확인
 
 이미지 로딩:
 
@@ -109,8 +141,9 @@ tail -f train.log
 ```
 
 - 실행 진입점: `run.py` 하나
+- 터미널: 진행바 표시. `nohup`: 진행바 없이 epoch 요약·중요 경고만 출력
 - bbox 준비·입력 검증 실패 시 모델 생성 전 중단
-- `crop_bbox=False`: 전체 이미지 학습
+- `crop_bbox=False`, `multi_roi=False`: 전체 이미지 학습
 - 기본 `300 epoch`; cosine LR도 300 기준
 - 새 실행마다 처음부터 학습. 기존 실행에 자동 resume·설정 반영 없음
 
@@ -119,6 +152,9 @@ tail -f train.log
 ```bash
 uv run python audit.py
 ```
+
+- 학습과 같은 bbox 준비·제외·좌표 검증 후 사용 이미지 decode 검사
+- 제외될 이미지는 검사하지 않음. 모델 생성·학습 없음
 
 기존 CIFAR 실험:
 
@@ -145,7 +181,7 @@ uv run python -m cifar.cifar_ssr
 - 평가 중 all-sample worker `16`개 유휴 상주; 상주 worker는 최대 `48`개
 - bbox JSON worker: `16`; 학습과 순차 실행
 - prefetch: worker당 `2` batch
-- worker 수는 실행 후보값. 실제 속도는 `train_samples/s`, `data_wait_s`로 확인
+- worker 수는 실행 후보값. 처리량·대기시간은 `metrics.jsonl`에서 확인
 - FP32 유지: loss 계산, feature 추출, k-NN, confidence, Label Wave·정확도 평가
 - TF32 미사용; SSR/LSL 수식·selection 규칙 유지
 - `runtime.deterministic=False`: cuDNN autotune; seed는 `0` 유지
@@ -186,6 +222,7 @@ python -u benchmark.py
 - Last: 마지막 완료 epoch
 - Label Wave: prediction change로만 선택. GT 지표 미사용
 - 모든 checkpoint: balanced accuracy·macro F1 함께 기록
+- checkpoint 입력 정보: crop 방식·letterbox 여백·학습 scale/offset·고정 평가 ROI 포함
 - validation 없음: Best 생략. LW 비활성·후보 없음: LW 생략
 - `metrics.jsonl`: epoch별 상세 지표
   - validation: accuracy, balanced accuracy, macro/weighted/micro F1, precision·recall
@@ -211,3 +248,4 @@ python -u benchmark.py
 - SSR: [BMVC 2022 논문](https://bmvc2022.mpi-inf.mpg.de/0372.pdf) / [저자 코드](https://github.com/MrChenFeng/SSR_BMVC2022)
 - LSL: [CVPR 2024 논문](https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_Learning_with_Structural_Labels_for_Learning_with_Noisy_Labels_CVPR_2024_paper.pdf), Algorithm 1/2 기준
 - Label Wave: [ICLR 2024 논문](https://proceedings.iclr.cc/paper_files/paper/2024/file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf) / [저자 코드](https://github.com/tmllab/2024_ICLR_LabelWave)
+- Multi-ROI·letterbox: 기존 `multi_roi/ConvNeXt/training/ConvNeXt_27view.py`, `roi_crops.py`에서 이식. 실행 시 외부 프로젝트 import 없음

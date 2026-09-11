@@ -75,7 +75,7 @@ def _extract_features_and_predictions(
     seen = torch.zeros(sample_count, dtype=torch.bool)
 
     with full_precision(device):
-        for images, indices in tqdm(loader, desc="Feature extraction", leave=False):
+        for images, indices in tqdm(loader, desc="Feature extraction", leave=False, disable=None):
             cpu_indices = _record_indices(indices, images.size(0), seen)
             images = _evaluation_images(images, device, channels_last)
             features = networks.encoder(images)
@@ -152,7 +152,7 @@ def predict_training_labels(
     predictions = torch.empty(sample_count, dtype=torch.long)
     seen = torch.zeros(sample_count, dtype=torch.bool)
     with full_precision(device):
-        for images, indices in tqdm(loader, desc="Prediction extraction", leave=False):
+        for images, indices in tqdm(loader, desc="Prediction extraction", leave=False, disable=None):
             cpu_indices = _record_indices(indices, images.size(0), seen)
             images = _evaluation_images(images, device, channels_last)
             features = networks.encoder(images)
@@ -185,7 +185,7 @@ def selection_metrics(
         target = modified[changed]
         encoded = source * num_classes + target
         values, counts = torch.unique(encoded, return_counts=True)
-        for value, count in zip(values.tolist(), counts.tolist()):
+        for value, count in torch.stack((values, counts), dim=1).tolist():
             transitions.append(
                 {
                     "from": int(value // num_classes),
@@ -194,21 +194,35 @@ def selection_metrics(
                 }
             )
 
+    # Collect small logging tensors before copying them to the host. Reduction
+    # precision is unchanged; only the number of CUDA synchronization points shrinks.
+    observed_counts, modified_counts, selected_counts, rejected_counts = torch.stack((
+        torch.bincount(noisy_labels, minlength=num_classes),
+        torch.bincount(modified, minlength=num_classes),
+        torch.bincount(modified[selected], minlength=num_classes),
+        torch.bincount(modified[rejected], minlength=num_classes),
+    )).tolist()
+    confidence_mean, confidence_min, confidence_max = torch.stack((
+        selection.confidences.mean(),
+        selection.confidences.min(),
+        selection.confidences.max(),
+    )).tolist()
+
     return {
         "selected": int(selected.numel()),
         "rejected": int(rejected.numel()),
         "selected_rate": float(selected.numel() / noisy_labels.numel()),
-        "observed_class_counts": torch.bincount(noisy_labels, minlength=num_classes).tolist(),
-        "modified_class_counts": torch.bincount(modified, minlength=num_classes).tolist(),
-        "selected_class_counts": torch.bincount(modified[selected], minlength=num_classes).tolist(),
-        "rejected_class_counts": torch.bincount(modified[rejected], minlength=num_classes).tolist(),
+        "observed_class_counts": observed_counts,
+        "modified_class_counts": modified_counts,
+        "selected_class_counts": selected_counts,
+        "rejected_class_counts": rejected_counts,
         "relabel_candidates": int(relabelled.numel()),
         # Kept for compatibility with existing result sheets/log parsers.
         "relabelled": int(relabelled.numel()),
         "label_changes": int(changed.numel()),
         "label_change_rate": float(changed.numel() / noisy_labels.numel()),
         "label_change_transitions": transitions,
-        "confidence_mean": float(selection.confidences.mean().item()),
-        "confidence_min": float(selection.confidences.min().item()),
-        "confidence_max": float(selection.confidences.max().item()),
+        "confidence_mean": float(confidence_mean),
+        "confidence_min": float(confidence_min),
+        "confidence_max": float(confidence_max),
     }

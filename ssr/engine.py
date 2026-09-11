@@ -247,7 +247,7 @@ def _prepare_config(config: ExperimentConfig) -> ExperimentConfig:
 def run(config: ExperimentConfig) -> float | None:
     """warm-up 없이 매 epoch relabel -> select -> optional LSL -> train."""
     config = _prepare_config(config)
-    print(f"run_dir={config.run_dir}")
+    print(f"run_dir={config.run_dir}\nPreparing data...", flush=True)
     write_config(config, config.run_dir)
     device = config.resolve_device()
     seed_everything(config.seed)
@@ -287,19 +287,17 @@ def run(config: ExperimentConfig) -> float | None:
         and not config.model.pretrained
     ):
         with full_precision(device):
-            calibration_batches = calibrate_batch_norm(
+            calibrate_batch_norm(
                 _build_calibration_loader(data, config, device),
                 networks.encoder,
                 device,
             )
-        print(f"initial_batch_norm_calibration_batches={calibration_batches}")
     optimizer = _build_optimizer(networks, config)
     checkpoints = CheckpointManager(config.run_dir, networks, optimizer, config)
     scheduler = _build_scheduler(optimizer, config)
 
-    print(f"device={device} run={config.run_name}")
     print(
-        f"train_precision={'bf16' if precision.amp else 'fp32'} "
+        f"device={device} train_precision={'bf16' if precision.amp else 'fp32'} "
         f"selection_precision=fp32 channels_last={precision.channels_last} "
         f"fused_adamw={bool(optimizer.defaults.get('fused', False))} "
         f"batch={config.training.batch_size} eval_batch={config.training.eval_batch_size} "
@@ -413,14 +411,12 @@ def run(config: ExperimentConfig) -> float | None:
                             selection={"method": "best", "split": "validation", "criterion": metric, "score": score},
                         )
             # These are comparisons to provided noisy labels, NOT clean accuracy.
-            prediction_counts = torch.bincount(
-                supervision.predictions, minlength=data.num_classes,
-            )
             observed_confusion = torch.bincount(
                 noisy_labels * data.num_classes + supervision.predictions,
                 minlength=data.num_classes**2,
             ).reshape(data.num_classes, data.num_classes)
             observed_metrics = metrics_from_confusion_matrix(observed_confusion, class_names=data.class_names)
+            prediction_counts = [item["predicted_count"] for item in observed_metrics["per_class"]]
             values = {
                 "epoch": epoch,
                 "completed_epochs": epoch + 1,
@@ -438,8 +434,8 @@ def run(config: ExperimentConfig) -> float | None:
                 "best_validation_macro_f1": best_scores["macro_f1"],
                 "best_epochs": dict(best_epochs),
                 "train_observed_label_metrics_before_update": observed_metrics,
-                "prediction_class_counts": prediction_counts.tolist(),
-                "prediction_dominant_class_fraction": float(prediction_counts.max().item() / training_samples),
+                "prediction_class_counts": prediction_counts,
+                "prediction_dominant_class_fraction": max(prediction_counts) / training_samples,
                 "total_loss": (
                     losses.supervised_loss
                     + config.ssr.feature_consistency_weight * losses.feature_consistency_loss
@@ -467,7 +463,6 @@ def run(config: ExperimentConfig) -> float | None:
             }
             metrics_writer.write(values)
             accuracy_summary = (
-                f"val_acc={current_accuracy:.2%} "
                 f"val_bal_acc={validation['balanced_accuracy']:.2%} "
                 f"val_macro_f1={validation['macro_f1']:.2%} "
                 f"best_bal_acc={best_scores['balanced_accuracy']:.2%} "
@@ -478,12 +473,9 @@ def run(config: ExperimentConfig) -> float | None:
             print(
                 f"epoch={epoch + 1}/{config.training.epochs} "
                 f"selected={values['selected']} "
-                f"relabel_candidates={values['relabel_candidates']} "
                 f"label_changes={values['label_changes']} "
                 f"{accuracy_summary} "
-                f"selection_s={selection_seconds:.1f} train_s={training_seconds:.1f} "
-                f"train_samples/s={samples_per_second:.1f} "
-                f"data_wait_s={losses.all_data_wait_seconds + losses.selected_data_wait_seconds:.1f}",
+                f"epoch_s={values['epoch_seconds']:.1f}",
                 flush=True,
             )
             del supervision, selected_loader

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -14,9 +15,10 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from setting.augmentation import AllSampleViews, TwoStrongViews, build_image_transforms
-from setting.bbox import BBox, clamp_bbox, prepare_bboxes
+from setting.bbox import BBox, prepare_bboxes, validate_crop_boxes
 from setting.config import AugmentationConfig, DataConfig, SplitConfig
 from setting.image_io import load_rgb_image, verify_image_files
+from setting.roi import ROICrop
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,34 @@ class SplitSource:
     paths: tuple[str, ...]
     labels: Tensor
     raw_paths: tuple[str, ...] = ()
+
+
+def _record_dataset_metadata(config: DataConfig, report_path: Path | None) -> None:
+    """Record optional NPY provenance, without sampling an already sampled dataset."""
+    metadata = {}
+    for filename in ("classes.json", "split_config.json"):
+        path = config.root / filename
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            print(f"Dataset metadata unavailable: {path}: {error}")
+            continue
+        if not isinstance(payload, dict):
+            print(f"Dataset metadata ignored: {path}: expected an object.")
+            continue
+        classes = payload.get("classes")
+        if classes is not None and classes != list(config.class_names):
+            raise ValueError(f"{path}: classes order does not match data.class_names.")
+        metadata[filename] = payload
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("a", encoding="utf-8") as report:
+            report.write(json.dumps({
+                "status": "dataset_metadata", "root": str(config.root),
+                "sampling": "as_provided", "metadata": metadata,
+            }, ensure_ascii=False) + "\n")
 
 
 def _resolve_array(root: Path, filename: str) -> Path:
@@ -123,37 +153,35 @@ def filter_bbox_sources(
         values = boxes[name]
         if len(values) != len(source.paths):
             raise ValueError(f"{name}: bbox count does not match image count.")
-        kept = [index for index, box in enumerate(values) if box is not None]
-        excluded_count = len(values) - len(kept)
-        labels = (
-            source.labels[torch.tensor(kept, dtype=torch.int64)]
-            if excluded_count else source.labels
-        )
+        excluded = [index for index, box in enumerate(values) if box is None]
+        input_count = len(values)
+        if excluded:
+            kept = [index for index, box in enumerate(values) if box is not None]
+            labels = source.labels[torch.tensor(kept, dtype=torch.int64)]
+        else:
+            labels = source.labels
         counts = torch.bincount(labels, minlength=config.num_classes).tolist()
         class_counts = dict(zip(config.class_names, counts))
         if report_path is not None:
             report_path.parent.mkdir(parents=True, exist_ok=True)
             with report_path.open("a", encoding="utf-8") as report:
-                for index, box in enumerate(values):
-                    if box is None:
-                        label = int(source.labels[index])
-                        report.write(json.dumps({
-                            "status": "bbox_excluded", "split": name, "index": index,
-                            "path": source.paths[index], "label": label,
-                            "class_name": config.class_names[label], "reason": "missing_bbox",
-                        }, ensure_ascii=False) + "\n")
+                for index in excluded:
+                    label = int(source.labels[index])
+                    report.write(json.dumps({
+                        "status": "bbox_excluded", "split": name, "index": index,
+                        "path": source.paths[index], "label": label,
+                        "class_name": config.class_names[label], "reason": "missing_bbox",
+                    }, ensure_ascii=False) + "\n")
                 report.write(json.dumps({
                     "status": "bbox_filter_summary", "split": name,
-                    "input_count": len(values), "excluded_count": excluded_count,
-                    "retained_count": len(kept), "class_counts": class_counts,
+                    "input_count": input_count, "excluded_count": len(excluded),
+                    "retained_count": len(labels), "class_counts": class_counts,
                 }, ensure_ascii=False) + "\n")
-        print(
-            f"[{name}] Bbox filter: {len(values)} -> {len(kept)} images; "
-            f"excluded={excluded_count}, class counts={class_counts}"
-        )
-        if not kept:
+        if excluded:
+            print(f"[{name}] Excluded {len(excluded)} missing bbox(es); {len(labels)} images remain.")
+        if not len(labels):
             raise ValueError(f"{name}: no samples remain after excluding missing bboxes.")
-        if excluded_count:
+        if excluded:
             source = replace(
                 source, paths=tuple(source.paths[index] for index in kept), labels=labels,
                 raw_paths=tuple(source.raw_paths[index] for index in kept) if source.raw_paths else (),
@@ -162,44 +190,6 @@ def filter_bbox_sources(
         filtered_sources[name] = source
         filtered_boxes[name] = values
     return filtered_sources, filtered_boxes
-
-
-def _validated_crop_boxes(
-    source: SplitSource, boxes: tuple[BBox | None, ...],
-    *, missing: str, report_path: Path | None,
-) -> tuple[BBox | None, ...]:
-    """Clamp against native dimensions once; reject unusable ROIs before training."""
-    if len(boxes) != len(source.paths):
-        raise ValueError(f"{source.name}: bbox count does not match image count.")
-    valid = []
-    failures = []
-    exceptional = []
-    for index, (path, box) in enumerate(zip(source.paths, boxes)):
-        if box is None:
-            valid.append(None)
-            continue
-        with Image.open(path) as image:
-            width, height = image.size
-        clipped = clamp_bbox(box, width, height)
-        if clipped is None or clipped != box:
-            exceptional.append({
-                "split": source.name, "index": index, "path": path,
-                "status": "bbox_clipped" if clipped else "bbox_outside_image",
-                "bbox": box, "clipped_bbox": clipped,
-            })
-        if clipped is None and missing != "full":
-            failures.append(f"{source.name}[{index}]: {path} bbox={box}")
-        valid.append(clipped)
-    if exceptional and report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        with report_path.open("a", encoding="utf-8") as report:
-            for row in exceptional:
-                report.write(json.dumps(row, ensure_ascii=False) + "\n")
-    if failures:
-        raise ValueError("Bboxes outside source images:\n" + "\n".join(failures[:10]))
-    missing_count = sum(box is None for box in valid)
-    print(f"[{source.name}] ROI crop: {len(valid) - missing_count}, full-image fallback: {missing_count}")
-    return tuple(valid)
 
 
 def inspect_dataset(
@@ -215,6 +205,7 @@ def inspect_dataset(
         for name, split in split_configs
         if split is not None
     }
+    _record_dataset_metadata(config, report_path)
     seen: set[str] = set()
     for name, source in sources.items():
         overlap = seen.intersection(source.paths)
@@ -255,7 +246,7 @@ class IndexedImageDataset(Dataset):
         transform: Callable[[Image.Image], object],
         *,
         allow_truncated: bool,
-        image_size: int,
+        roi: ROICrop,
         labeled: bool = False,
         bboxes: tuple[BBox | None, ...] | None = None,
     ) -> None:
@@ -263,7 +254,7 @@ class IndexedImageDataset(Dataset):
         self.transform = transform
         self.allow_truncated = allow_truncated
         self.labeled = labeled
-        self.image_size = image_size
+        self.roi = roi
         self.bboxes = bboxes
 
     def __len__(self) -> int:
@@ -272,24 +263,15 @@ class IndexedImageDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[object, int | Tensor]:
         path = self.source.paths[index]
         box = self.bboxes[index] if self.bboxes is not None else None
-        image = None
         try:
             image, _ = load_rgb_image(path, allow_truncated=self.allow_truncated)
-            if box is not None:
-                cropped = image.crop(box)
-                image.close()
-                image = cropped
-            size = (self.image_size, self.image_size)
-            if image.size != size:
-                resized = image.resize(size, Image.Resampling.BICUBIC)
-                image.close()
-                image = resized
-            transformed = self.transform(image)
+            with closing(image):
+                cropped = self.roi(image, box)
+            # Full-resolution RGB is released before multi-view transforms.
+            with closing(cropped):
+                transformed = self.transform(cropped)
         except (OSError, ValueError, Image.DecompressionBombError) as error:
             raise RuntimeError(f"Failed to load {self.source.name}[{index}]: {path}") from error
-        finally:
-            if image is not None:
-                image.close()
         return transformed, self.source.labels[index] if self.labeled else index
 
 
@@ -306,14 +288,10 @@ class ExperimentData:
     class_names: tuple[str, ...]
 
 
-def build_experiment_data(
-    config: DataConfig,
-    *,
-    structural_labels_enabled: bool,
-    augmentation: AugmentationConfig,
-    report_path: Path | None = None,
-) -> ExperimentData:
-    """Use provided labels unchanged; transforms run in seeded DataLoader workers."""
+def prepare_dataset(
+    config: DataConfig, *, report_path: Path | None = None,
+) -> tuple[dict[str, SplitSource], dict[str, tuple[BBox | None, ...]]]:
+    """Shared run/audit preparation: arrays → bbox exclusion → image validation."""
     sources = inspect_dataset(
         replace(config, verify_images=False), report_path=report_path,
     )
@@ -322,16 +300,28 @@ def build_experiment_data(
     if config.verify_images:
         _verify_sources(config, sources, report_path)
     boxes = {
-        name: _validated_crop_boxes(
-            sources[name], values,
+        name: validate_crop_boxes(
+            sources[name].paths, values, name, workers=config.bbox_workers,
             missing=config.missing_bbox, report_path=report_path,
         )
         for name, values in boxes.items()
     }
+    return sources, boxes
+
+
+def build_experiment_data(
+    config: DataConfig,
+    *,
+    structural_labels_enabled: bool,
+    augmentation: AugmentationConfig,
+    report_path: Path | None = None,
+) -> ExperimentData:
+    """Use provided labels unchanged; transforms run in seeded DataLoader workers."""
+    sources, boxes = prepare_dataset(config, report_path=report_path)
     transforms = build_image_transforms(config, augmentation)
 
     def dataset(
-        name: str, transform: Callable, *, labeled: bool = False
+        name: str, transform: Callable, *, labeled: bool = False, training: bool = False
     ) -> IndexedImageDataset | None:
         source = sources.get(name)
         if source is None:
@@ -339,13 +329,23 @@ def build_experiment_data(
         return IndexedImageDataset(
             source, transform,
             allow_truncated=config.allow_truncated_images, labeled=labeled,
-            image_size=config.image_size, bboxes=boxes.get(name),
+            bboxes=boxes.get(name),
+            roi=ROICrop(
+                size=config.image_size, method=config.crop_method,
+                random_view=training and config.multi_roi,
+                scales=config.roi_scales, shift_ratio=config.roi_shift_ratio,
+            ),
         )
 
+    print(
+        f"ROI input: train={'random multi-ROI' if config.multi_roi else 'fixed center'} "
+        f"crop_method={config.crop_method} size={config.image_size}; "
+        "selection/Label Wave/val/test=fixed center"
+    )
     fixed_train = dataset("train", transforms.evaluation)
     return ExperimentData(
         calibration_train=fixed_train,
-        selected_train=dataset("train", TwoStrongViews(transforms.strong)),
+        selected_train=dataset("train", TwoStrongViews(transforms.strong), training=True),
         evaluation_train=fixed_train,
         all_train=dataset(
             "train",
@@ -353,6 +353,7 @@ def build_experiment_data(
                 transforms.weak, transforms.strong,
                 include_structural_view=structural_labels_enabled,
             ),
+            training=True,
         ),
         validation=dataset("val", transforms.evaluation, labeled=True),
         test=dataset("test", transforms.evaluation, labeled=True),

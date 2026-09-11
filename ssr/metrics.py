@@ -126,7 +126,7 @@ def evaluate_classification(
     sample_count = 0
 
     with full_precision(device):
-        for images, labels in tqdm(loader, desc=description, leave=False):
+        for images, labels in tqdm(loader, desc=description, leave=False, disable=None):
             if images.size(0) == 0:
                 raise ValueError("Evaluation batches must not be empty.")
             images = _evaluation_images(images, device, channels_last)

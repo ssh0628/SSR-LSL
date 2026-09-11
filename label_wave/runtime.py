@@ -70,10 +70,6 @@ class LabelWaveRun:
                 },
                 selection={"method": "label_wave", "criterion": "prediction_change"},
             )
-            print(
-                f"label_wave candidate_epoch={completed_epochs} "
-                f"pc_ma={observation.moving_average:.2f}"
-            )
         if observation.should_stop:
             print(
                 f"label_wave selected_epoch={observation.selected_epoch} "
