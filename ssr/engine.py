@@ -325,8 +325,6 @@ def run(config: ExperimentConfig) -> float | None:
             stack.enter_context(label_wave)
         for epoch in range(config.training.epochs):
             epoch_started = _timestamp(device)
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats(device)
             selection_started = _timestamp(device)
             supervision = evaluate_epoch(
                 loaders.evaluation,
@@ -369,10 +367,6 @@ def run(config: ExperimentConfig) -> float | None:
                 epoch,
             )
             training_seconds = _timestamp(device) - training_started
-            train_steps = len(loaders.all_samples)
-            samples_per_second = (
-                train_steps * config.training.batch_size / max(training_seconds, 1e-9)
-            )
             scheduler.step()
             last_completed_epoch = epoch
             validation = None
@@ -386,19 +380,20 @@ def run(config: ExperimentConfig) -> float | None:
                     )
             finally:
                 validation_seconds = _timestamp(device) - validation_started
+                current_accuracy = validation["accuracy"] if validation else None
+                checkpoint_metrics = {
+                    "validation_accuracy": current_accuracy,
+                    "validation": validation,
+                }
                 # A validation error must not discard the just-trained model.
                 # Save once per completed epoch, even when evaluation fails.
                 checkpoints.save(
                     "last.pt",
                     epoch,
-                    metrics={
-                        "validation_accuracy": validation["accuracy"] if validation else None,
-                        "validation": validation,
-                    },
+                    metrics=checkpoint_metrics,
                     selection={"method": "last", "criterion": "last_epoch"},
                 )
             last_validation = validation
-            current_accuracy = validation["accuracy"] if validation else None
             if current_accuracy is not None:
                 best_accuracy = max(best_accuracy if best_accuracy is not None else -1.0, current_accuracy)
                 for metric in SELECTION_METRICS:
@@ -407,7 +402,7 @@ def run(config: ExperimentConfig) -> float | None:
                         best_scores[metric], best_epochs[metric] = score, epoch + 1
                         checkpoints.save(
                             f"best_{metric}.pt", epoch,
-                            metrics={"validation_accuracy": current_accuracy, "validation": validation},
+                            metrics=checkpoint_metrics,
                             selection={"method": "best", "split": "validation", "criterion": metric, "score": score},
                         )
             # These are comparisons to provided noisy labels, NOT clean accuracy.
@@ -429,7 +424,6 @@ def run(config: ExperimentConfig) -> float | None:
                 "validation_macro_f1": validation["macro_f1"] if validation else None,
                 "validation": validation,
                 "best_validation_accuracy": best_accuracy,
-                "best_accuracy": best_accuracy,
                 "best_validation_balanced_accuracy": best_scores["balanced_accuracy"],
                 "best_validation_macro_f1": best_scores["macro_f1"],
                 "best_epochs": dict(best_epochs),
@@ -445,16 +439,6 @@ def run(config: ExperimentConfig) -> float | None:
                 "training_seconds": training_seconds,
                 "validation_seconds": validation_seconds,
                 "epoch_seconds": _timestamp(device) - epoch_started,
-                "train_steps": train_steps,
-                "train_samples_per_second": samples_per_second,
-                "cuda_peak_allocated_gib": (
-                    torch.cuda.max_memory_allocated(device) / 1024**3
-                    if device.type == "cuda" else None
-                ),
-                "cuda_peak_reserved_gib": (
-                    torch.cuda.max_memory_reserved(device) / 1024**3
-                    if device.type == "cuda" else None
-                ),
                 **selection_metrics(
                     supervision.selection,
                     noisy_labels,

@@ -9,10 +9,10 @@ import torch
 from torch import nn
 from torch.optim import SGD
 
-from cifar.label_wave import LabelWaveRun, LabelWaveTracker
-from cifar.log.checkpoint import CheckpointManager
-from cifar.setting.config import CONFIG, LabelWaveConfig, RuntimeConfig, TrainingConfig
-from cifar.setting.model import SSRNetworks
+from label_wave import LabelWaveRun, LabelWaveTracker
+from log.checkpoint import CheckpointManager
+from setting.config import CONFIG, LabelWaveConfig, RuntimeConfig, TrainingConfig
+from setting.model import SSRNetworks
 
 
 class LabelWaveTrackerTest(unittest.TestCase):
@@ -97,12 +97,12 @@ class LabelWaveTrackerTest(unittest.TestCase):
                 run.observe(
                     torch.tensor([0, 0, 0]),
                     completed_epochs=0,
-                    test_accuracy=None,
+                    validation_accuracy=None,
                 )
                 run.observe(
                     torch.tensor([1, 0, 1]),
                     completed_epochs=1,
-                    test_accuracy=0.8,
+                    validation_accuracy=0.8,
                 )
 
             checkpoint = torch.load(
@@ -112,7 +112,8 @@ class LabelWaveTrackerTest(unittest.TestCase):
             )
             self.assertEqual(checkpoint["cur_epoch"], 0)
             self.assertEqual(checkpoint["label_wave"]["selected_epoch"], 1)
-            self.assertEqual(checkpoint["test_accuracy"], 0.8)
+            self.assertEqual(checkpoint["metrics"]["validation_accuracy"], 0.8)
+            self.assertNotIn("test_accuracy", checkpoint)
             self.assertEqual(len(log_path.read_text(encoding="utf-8").splitlines()), 2)
 
     def test_label_wave_config_rejects_ambiguous_or_impossible_modes(self) -> None:

@@ -11,7 +11,6 @@ from torch.optim import Optimizer
 from log.common import atomic_torch_save
 from setting.config import ExperimentConfig
 from setting.model import SSRNetworks
-from setting.roi import LETTERBOX_FILL
 
 
 SELECTION_METRICS = ("balanced_accuracy", "macro_f1")
@@ -63,15 +62,6 @@ class CheckpointManager:
                 "mean": list(self.config.data.mean),
                 "std": list(self.config.data.std),
                 "label_offset": self.config.data.label_offset,
-                "crop_bbox": self.config.data.crop_bbox,
-                "missing_bbox": self.config.data.missing_bbox,
-                "crop_method": self.config.data.crop_method,
-                "multi_roi": self.config.data.multi_roi,
-                "roi_scales": list(self.config.data.roi_scales),
-                "roi_shift_ratio": self.config.data.roi_shift_ratio,
-                "letterbox_fill": list(LETTERBOX_FILL),
-                "roi_padding_fill": 0,
-                "evaluation_roi": "center" if self.config.data.crop_bbox else "full",
             },
             "structural_labels_enabled": self.config.structural_labels.enabled,
             "classifier": self.networks.classifier.state_dict(),

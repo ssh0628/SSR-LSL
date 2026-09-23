@@ -54,7 +54,7 @@ class AllSampleViews:
 
 
 def build_image_transforms(data: DataConfig, config: AugmentationConfig) -> ImageTransforms:
-    """Augment images already cropped and resized once by the dataset."""
+    """Augment full images already resized once by the dataset."""
     to_tensor = transforms.ToTensor()
     normalize = transforms.Normalize(data.mean, data.std)
 

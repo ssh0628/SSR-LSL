@@ -1,4 +1,4 @@
-"""General image-dataset configuration; CIFAR experiments live in cifar/."""
+"""Configuration for the public SSR/LSL training pipeline."""
 
 from __future__ import annotations
 
@@ -7,25 +7,18 @@ import json
 from dataclasses import asdict, dataclass, field
 from math import isfinite
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Literal
 
 import torch
 
 # - 경로: 아래 값 직접 수정
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # 프로젝트
-DATASET_ROOT = Path("/root/project/dataset/npy_path/consensus/sqrt/modify_same_as_orig")  # multi_roi sqrt NPY
+DATASET_ROOT = PROJECT_ROOT / "data"  # 사용자 NPY 루트
 OUTPUT_ROOT = PROJECT_ROOT / "outputs"  # 학습 결과
 
-# - H100 NVL: batch 256/1024, workers 16×2/32, prefetch 2; train 512 OOM
-# - RTX 5080: train 16 / eval 64 / prefetch 1; 시작값
+# - 예시 설정: 데이터·GPU에 맞게 조절
+# - 기존 실험 설정: experiment_folder/setting/config.py
 OptimizerName = Literal["sgd", "adamw"]
-MissingBBoxPolicy = Literal["drop", "error", "full"]
-ROICropMethod = Literal["roi_resize", "aspect_letterbox"]
-
-
-def validate_missing_bbox(policy: str) -> None:
-    if policy not in get_args(MissingBBoxPolicy):
-        raise ValueError(f"data.missing_bbox must be one of {get_args(MissingBBoxPolicy)}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,24 +27,20 @@ class SplitConfig:
 
     paths: str  # 이미지 경로 NPY
     labels: str  # 정수 class index NPY
-    bboxes: str | None = None  # None: bbox cache 자동 탐색·생성
 
     def validate(self) -> None:
         if not self.paths.strip() or not self.labels.strip():
             raise ValueError("Split paths/labels filenames must not be empty.")
-        if self.bboxes is not None and not self.bboxes.strip():
-            raise ValueError("Split bbox filename must not be empty.")
 
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    """이미지·라벨·bbox 입력."""
+    """이미지 경로·라벨 NPY 입력."""
 
     root: Path = field(default_factory=lambda: DATASET_ROOT)  # NPY 루트
     image_root: Path | None = None  # 상대 이미지 경로 기준; None: root
-    annotation_root: Path | None = None  # JSON 루트; None: 이미지 옆
-    name: str = "a1-a7-multi-roi-sqrt"  # 실험 이름
-    class_names: tuple[str, ...] = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")  # 라벨 순서
+    name: str = "images"  # 실험 이름
+    class_names: tuple[str, ...] = ("class_0", "class_1")  # 사용자 클래스·라벨 순서
     train: SplitConfig = field(
         default_factory=lambda: SplitConfig("train_path.npy", "train_labels.npy")
     )
@@ -62,14 +51,7 @@ class DataConfig:
         default_factory=lambda: SplitConfig("test_path.npy", "test_labels.npy")
     )  # None: test 생략
     label_offset: int = 0  # 라벨 시작 번호
-    crop_bbox: bool = True  # 전체 이미지에서 bbox crop
-    multi_roi: bool = True  # 학습: 27개 scale·방향 중 1개
-    crop_method: ROICropMethod = "aspect_letterbox"  # 비율 유지·패딩 / roi_resize: 정사각 변형
-    roi_scales: tuple[float, ...] = (0.8, 1.0, 1.2)  # bbox 크기 배율
-    roi_shift_ratio: float = 0.15  # 방향별 이동 상한; crop 크기 기준
-    missing_bbox: MissingBBoxPolicy = "drop"  # 누락: 제외 / 중단 / 전체 이미지
-    image_size: int = 224  # crop 후 resize
-    bbox_workers: int = 16  # bbox JSON·이미지 크기 확인 worker
+    image_size: int = 224  # 전체 이미지 정사각 resize
     mean: tuple[float, float, float] = (0.485, 0.456, 0.406)  # 정규화 평균
     std: tuple[float, float, float] = (0.229, 0.224, 0.225)  # 정규화 표준편차
     allow_truncated_images: bool = True  # 잘린 이미지 재시도
@@ -87,17 +69,6 @@ class DataConfig:
             raise ValueError("data.train must specify paths and labels files.")
         if self.image_root is not None and not self.image_root.is_absolute():
             raise ValueError("data.image_root must be an absolute path.")
-        if self.annotation_root is not None and not self.annotation_root.is_absolute():
-            raise ValueError("data.annotation_root must be an absolute path.")
-        validate_missing_bbox(self.missing_bbox)
-        if self.multi_roi and not self.crop_bbox:
-            raise ValueError("data.multi_roi requires data.crop_bbox=True.")
-        if self.crop_method not in get_args(ROICropMethod):
-            raise ValueError(f"data.crop_method must be one of {get_args(ROICropMethod)}.")
-        if not self.roi_scales or any(not isfinite(v) or v <= 0 for v in self.roi_scales):
-            raise ValueError("data.roi_scales must contain positive finite scales.")
-        if not isfinite(self.roi_shift_ratio) or not 0 <= self.roi_shift_ratio <= 1:
-            raise ValueError("data.roi_shift_ratio must be in [0, 1].")
         if (
             not self.name
             or not self.name.isascii()
@@ -124,8 +95,6 @@ class DataConfig:
             raise ValueError("data.mean/std must have three finite channels and positive std.")
         if self.image_check_workers < 1:
             raise ValueError("data.image_check_workers must be positive.")
-        if self.bbox_workers < 1:
-            raise ValueError("data.bbox_workers must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,8 +216,8 @@ class TrainingConfig:
     """일반 이미지 데이터셋 학습 설정."""
 
     epochs: int = 300  # 학습·cosine 길이
-    batch_size: int = 256  # 학습; mixup 입력은 2배
-    eval_batch_size: int = 1024  # FP32 평가
+    batch_size: int = 32  # 학습; mixup 입력은 2배
+    eval_batch_size: int = 128  # FP32 평가
     amp: bool = True  # CUDA 학습 BF16
     channels_last: bool = True  # CUDA 메모리 배치
     fused_optimizer: bool = True  # CUDA fused AdamW
@@ -258,8 +227,8 @@ class TrainingConfig:
     momentum: float = 0.9  # SGD momentum
     weight_decay: float = 0.1  # weight decay
     scheduler_eta_min_ratio: float = 1e-3  # 최저 LR / 초기 LR
-    num_workers: int = 16  # 학습 loader당 worker; 동시 32개
-    eval_num_workers: int = 32  # feature 추출·평가 worker
+    num_workers: int = 4  # 학습 loader당 worker; 두 loader 동시 사용
+    eval_num_workers: int = 4  # feature 추출·평가 worker
     prefetch_factor: int = 2  # worker당 선행 batch
     persistent_workers: bool = True  # all-sample worker 유지
     log_interval: int = 20  # 진행 표시 step 간격

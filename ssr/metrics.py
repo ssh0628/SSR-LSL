@@ -10,6 +10,7 @@ the multiclass Brier score is the summed squared probability error in [0, 2].
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -99,25 +100,24 @@ def _labels_for_batch(labels: Tensor, batch_size: int, classes: int, device: tor
     return labels.to(device, dtype=torch.long, non_blocking=True)
 
 
-@torch.no_grad()
-def evaluate_classification(
-    loader: DataLoader,
-    networks: SSRNetworks,
-    device: torch.device,
-    *,
-    description: str = "Validation",
-    channels_last: bool = False,
-    class_names: tuple[str, ...] | None = None,
-) -> dict[str, Any]:
-    """Evaluate in full precision; one forward pass and O(classes²) memory.
+def _validate_logits(logits: Tensor, batch_size: int | None = None) -> None:
+    if (
+        not isinstance(logits, Tensor) or logits.ndim != 2 or logits.size(1) == 0
+        or (batch_size is not None and logits.size(0) != batch_size)
+    ):
+        raise ValueError("Classifier logits must have shape (batch_size, num_classes).")
+    if logits.size(0) == 0:
+        raise ValueError("Evaluation batches must not be empty.")
+    if not logits.is_floating_point():
+        raise ValueError("Classifier logits must be floating point.")
 
-    Networks remain in evaluation mode, matching the previous accuracy helper.
-    Top-2 accuracy is None for a single-output classifier. ECE uses 15 equal
-    width confidence bins: [i/15, (i+1)/15), with confidence 1 in the last bin.
-    FP16/BF16 inputs and logits are promoted to FP32; diagnostic FP64 is kept.
-    """
-    device = torch.device(device)
-    networks.eval()
+
+def _metrics_from_batches(
+    batches: Iterable[tuple[Tensor, Tensor]],
+    device: torch.device,
+    class_names: tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Accumulate validated logits with the same definitions for every evaluator."""
     # MPS does not support float64; model inference itself remains FP32.
     accumulation_dtype = torch.float32 if device.type == "mps" else torch.float64
     totals = torch.zeros(5, dtype=accumulation_dtype, device=device)
@@ -126,16 +126,7 @@ def evaluate_classification(
     sample_count = 0
 
     with full_precision(device):
-        for images, labels in tqdm(loader, desc=description, leave=False, disable=None):
-            if images.size(0) == 0:
-                raise ValueError("Evaluation batches must not be empty.")
-            images = _evaluation_images(images, device, channels_last)
-            features = networks.encoder(images)
-            logits = networks.classifier(features)
-            if logits.ndim != 2 or logits.size(0) != images.size(0) or logits.size(1) == 0:
-                raise ValueError("Classifier logits must have shape (batch_size, num_classes).")
-            if not logits.is_floating_point():
-                raise ValueError("Classifier logits must be floating point.")
+        for logits, labels in batches:
             classes = logits.size(1)
             if matrix is None:
                 if class_names is not None and (
@@ -145,9 +136,7 @@ def evaluate_classification(
                 matrix = torch.zeros((classes, classes), dtype=torch.int64, device=device)
             elif matrix.size(0) != classes:
                 raise ValueError("Classifier output class count changed between batches.")
-            labels = _labels_for_batch(labels, images.size(0), classes, device)
-            # One explicit output-validity check per batch; no per-metric .item().
-            _validate_model_outputs(features, logits)
+            labels = _labels_for_batch(labels, logits.size(0), classes, device)
             if logits.dtype in (torch.float16, torch.bfloat16):
                 logits = logits.float()
             log_probabilities = logits.log_softmax(dim=1)
@@ -173,7 +162,7 @@ def evaluate_classification(
             bins = (confidence * _CALIBRATION_BINS).long().clamp_max(_CALIBRATION_BINS - 1)
             calibration[0].scatter_add_(0, bins, confidence.to(accumulation_dtype))
             calibration[1].scatter_add_(0, bins, correct.to(accumulation_dtype))
-            sample_count += images.size(0)
+            sample_count += logits.size(0)
 
     if matrix is None or sample_count == 0:
         raise RuntimeError("Classification evaluation loader is empty.")
@@ -191,3 +180,51 @@ def evaluate_classification(
         "calibration_bins": _CALIBRATION_BINS,
     })
     return result
+
+
+@torch.no_grad()
+def metrics_from_logits(
+    logits: Tensor,
+    labels: Tensor,
+    *,
+    class_names: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Score final [N, C] logits, e.g. logits averaged over multiple ROI views."""
+    _validate_logits(logits)
+    if not torch.isfinite(logits).all().item():
+        raise FloatingPointError("Classification evaluation received non-finite logits.")
+    return _metrics_from_batches(((logits, labels),), logits.device, class_names)
+
+
+@torch.no_grad()
+def evaluate_classification(
+    loader: DataLoader,
+    networks: SSRNetworks,
+    device: torch.device,
+    *,
+    description: str = "Validation",
+    channels_last: bool = False,
+    class_names: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Evaluate in full precision; one forward pass and O(classes²) memory.
+
+    Networks remain in evaluation mode, matching the previous accuracy helper.
+    Top-2 accuracy is None for a single-output classifier. ECE uses 15 equal
+    width confidence bins: [i/15, (i+1)/15), with confidence 1 in the last bin.
+    FP16/BF16 inputs and logits are promoted to FP32; diagnostic FP64 is kept.
+    """
+    device = torch.device(device)
+    networks.eval()
+
+    def batches() -> Iterable[tuple[Tensor, Tensor]]:
+        for images, labels in tqdm(loader, desc=description, leave=False, disable=None):
+            if images.size(0) == 0:
+                raise ValueError("Evaluation batches must not be empty.")
+            images = _evaluation_images(images, device, channels_last)
+            features = networks.encoder(images)
+            logits = networks.classifier(features)
+            _validate_logits(logits, images.size(0))
+            _validate_model_outputs(features, logits)
+            yield logits, labels
+
+    return _metrics_from_batches(batches(), device, class_names)

@@ -1,251 +1,109 @@
 # SSR-LSL
 
-- 루트: 사용자 이미지 데이터셋 학습
-- `cifar/`: 기존 CIFAR-10 실험 독립 보관
-- config: `setting/config.py`
-- seed: `0`
-- 기본값: pretrained ConvNeXtV2-Tiny, SSR + LSL, Label Wave 저장
-- SSR/LSL 수식·sample selection 유지
-- 기본 데이터: `multi_roi`의 consensus + sqrt NPY
-- 입력: 원본 이미지 → random Multi-ROI → aspect letterbox 224 → 증강
-- 이미지 픽셀 복제·대용량 RGB 캐시 생성 없음
-- 추가 noise·중복 sqrt 다운샘플링 없음
+노이즈 라벨 학습 논문 구현·확장 프로젝트.
+
+- SSR: confidence 기반 라벨 수정, k-NN sample selection, mixup CE, feature consistency
+- LSL: reverse k-NN으로 structural target 생성, soft-label loss 추가
+- Label Wave: train prediction 변화량으로 checkpoint 선택
+- 각 알고리즘은 원 논문·저자 코드 기반. 새로운 알고리즘 제안이 아닌 구현·실험 목적
+
+## 구현 범위
+
+- SSR 학습 루프에 LSL·Label Wave를 독립 옵션으로 통합
+- timm backbone 교체, 사용자 이미지 데이터셋 지원
+- CUDA BF16 학습·channels-last·fused AdamW 옵션
+- selection·k-NN·평가는 FP32 유지
+- 라벨 변경 수·클래스별 지표·checkpoint 선택 기록
+- 핵심 수식, 학습 경로, checkpoint 저장 회귀 테스트
 
 ## 구조
 
 ```text
-run.py         bbox 준비 → 학습 → checkpoint 평가
-audit.py
-benchmark.py
-setting/       config, NPY loader, bbox, Multi-ROI·letterbox, augmentation, model 구성
-models/        backbone
-ssr/           relabel, k-NN selection, loss, 학습
-lsl/           reverse k-NN, structural loss
-label_wave/    prediction change, checkpoint 선택
-log/           config, metric, checkpoint 저장
-cifar/         기존 구조·실험 큐·설정 복사본
+run.py          학습 → checkpoint 평가
+audit.py        데이터 검사
+setting/        config, NPY loader, 증강, 모델 구성
+models/         timm backbone
+ssr/            라벨 수정, sample selection, loss, 학습
+lsl/            reverse k-NN, structural loss
+label_wave/     prediction change, checkpoint 선택
+log/            설정·지표·모델 저장
+tests/          핵심 구현·실행 검증
 ```
 
-- 루트와 `cifar/`는 서로 import하지 않음
-- `custom/` 폐기
-- 기존 결과 파일은 이동·삭제하지 않음
-
-## 데이터 설정
-
-`setting/config.py` 상단에서 경로 지정:
-
-```python
-DATASET_ROOT = Path("/root/project/dataset/npy_path/consensus/sqrt/modify_same_as_orig")
-OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-```
-
-`DataConfig`에서 입력 정보 지정:
-
-```python
-class_names = ("A1", "A2", "A3", "A4", "A5", "A6", "A7")
-train = SplitConfig("train_path.npy", "train_labels.npy")
-validation = SplitConfig("val_path.npy", "val_labels.npy")
-test = SplitConfig("test_path.npy", "test_labels.npy")
-image_size = 224
-crop_bbox = True
-multi_roi = True
-crop_method = "aspect_letterbox"
-roi_scales = (0.8, 1.0, 1.2)
-roi_shift_ratio = 0.15
-```
-
-- paths: 이미지 경로 문자열 NPY, shape `(N,)`
-- labels: 정수 class index NPY, shape `(N,)`
-- 클래스 순서: `class_names[0]` → label `0`
-- 1부터 시작하는 라벨: `label_offset=1`
-- 상대 이미지 경로: `image_root` 기준. `None`이면 NPY root 기준
-- 기본 파일명은 `*_path.npy`, `*_paths.npy` 둘 다 지원
-- 다른 파일명: `SplitConfig`에서 직접 지정
-- validation/test가 없으면 해당 필드를 `None`
-- `split_config.json`, `classes.json` 필수 아님
-- 메타데이터가 있으면 클래스 순서 확인·`data_audit.jsonl`에 기록
-- `use_sqrt` 누락: 중단하지 않음. NPY 재다운샘플링 없음
-- 클래스 수: `class_names`에서 자동 계산
-
-Sqrt 데이터셋:
-
-- 기본 경로: `multi_roi/ConvNeXt/training/total_run.py`의 NPY 경로
-- 원본·수정본의 동일 클래스·ID 매칭 후 sqrt 다운샘플링한 기존 split 사용
-- 기본 목표 수: 클래스별 `floor(sqrt(N_class × N_min))`; 중복 추출 없음
-- train·val·test: 각 NPY를 그대로 사용. 다시 split·다운샘플링하지 않음
-- 다른 sqrt NPY 사용: `DATASET_ROOT`만 변경
-- 기존 SSR의 전체 `modify_npy`와 평가 표본이 다를 수 있음. 직접 성능 비교 시 같은 split 필요
-- SSR selected-sample class-balanced sampler는 유지; dataset 다운샘플링과 별개
-
-Multi-ROI / aspect letterbox:
-
-- 학습: 샘플 접근마다 scale 3개 × 방향 9개 중 1개 균등 선택
-- scale: `0.8 / 1.0 / 1.2`; 방향: 중앙·상하좌우·대각선
-- 이동: 방향별 `0~0.15 × 해당 crop 너비/높이`
-- ROI는 원본 이미지에서 추출. 기존 bbox 바깥의 실제 배경 포함
-- 이미지 경계 밖: 검정 패딩. letterbox 여백: RGB `(124, 116, 104)`
-- 긴 변 224로 bicubic resize → 중앙 배치. ROI 종횡비 유지
-- 접근당 crop 1회 공유 → 기존 weak·strong 증강은 각각 독립
-- SSR 특징 추출·k-NN·LSL target·Label Wave: 고정 중앙 ROI
-- validation·최종 test: 고정 중앙 ROI. 27-view TTA 평균 아님
-- `multi_roi=False`: scale·offset만 비활성. letterbox 유지
-- 이전 단일-ROI 입력: `multi_roi=False`, `crop_method="roi_resize"`
-
-Bbox:
-
-- 학습 시작 시 train·val·test bbox 좌표 NPZ 준비. 기존 유효 cache 재사용
-- 이미지 픽셀 미포함: 이미지당 좌표 4개만 저장
-- 기본: `*_bboxes_cache_v1.npz`; `*_bbox_cache_v1.npz`도 지원
-- 직접 지정: `SplitConfig(paths, labels, bboxes="파일명.npz")`
-- 이미지 순서·원본 경로 fingerprint 검증; 다른 NPY와 잘못 연결 방지
-- cache 없으면 JSON의 `labelingInfo → box → location[0]`에서 생성
-- 기존 cache의 누락 항목: 시작 시 해당 JSON만 재확인·복구
-- JSON 탐색: 이미지 옆 `.json`, `.JSON`, `이미지확장자.json`
-- 별도 JSON 폴더: `annotation_root` 지정; `image_root` 기준 하위 경로 유지
-- `missing_bbox="drop"` 기본: JSON에도 bbox가 없으면 train·val·test에서 제외
-- 빈 JSON·깨진 JSON·UTF-8 해석 실패: `drop`에서 제외하고 원인 기록
-- 제외: 원본 이미지·NPY 삭제 없이 경로·라벨·bbox를 같은 순서로 필터링
-- `missing_bbox="error"`: 좌표 누락 시 목록 출력 후 중단
-- `missing_bbox="full"`: 누락 이미지만 전체 입력. 명시적 선택 시에만 허용
-- 잘못된 좌표·경로 설정, 이미지 밖 bbox, 제외 후 빈 split: 중단
-- 원본 크기로 좌표 clamp. 이미 유효한 cache의 JSON 좌표 수정 시 재생성 필요
-- 이미지 크기 확인: `bbox_workers`로 제한 병렬 처리. decode 없이 header만 확인
-
-이미지 로딩:
-
-- 원본은 디스크에 그대로 보존. worker에서 decode·crop·resize
-- crop·resize는 sample당 1회; weak·strong 증강은 view별 독립 적용
-- 전체 이미지 디스크 캐시 기능 제거. 기존 서버 캐시 자동 삭제 없음
-
-이미지 검사:
-
-- `verify_images=True`: bbox 필터링 후 사용 이미지 전체 decode 검사
-- `allow_truncated_images=True`: 잘린 이미지의 decoder 재시도 허용
-- 사전 검사 시 재시도 성공/실패 경로: `data_audit.jsonl`
-- 완전히 읽을 수 없는 파일: 경로를 모아서 보고하고 중단
-- 검정 이미지 대체 없음. bbox 누락 제외와 이미지 decode 실패는 별도 처리
+- 기존 CIFAR·Multi-ROI 실험: 로컬 `experiment_folder/`에 분리, Git 제외
+- 공개 코드에서 실험 폴더 import 없음
+- 이미지·학습 결과·가중치 미포함
 
 ## 실행
 
+Python 3.10 이상. 프로젝트 루트에서 실행.
+
 ```bash
 uv sync
+uv run python audit.py
 uv run python run.py
 ```
 
-서버:
+먼저 `setting/config.py` 수정:
+
+- `DATASET_ROOT`, `OUTPUT_ROOT`: 데이터·결과 저장 경로
+- `DataConfig.class_names`: 라벨 번호순 클래스 이름
+- `SplitConfig`: train / validation / test NPY 파일명
+- `ModelConfig`: backbone·pretrained 여부
+- `TrainingConfig`: batch·LR·epoch·worker
+- pretrained 사용 시 첫 실행에서 가중치 다운로드
+
+입력 형식:
+
+- `*_path.npy`: 이미지 경로 문자열 배열 `(N,)`, pickle 미사용
+- `*_labels.npy`: 정수 라벨 배열 `(N,)`, 기본 `0 … C-1`
+- 상대 이미지 경로: `image_root` 기준. `None`이면 `DATASET_ROOT` 기준
+- validation/test가 없으면 해당 설정을 `None`
+- train / validation / test 경로 중복 차단
+- 원본 RGB → 정사각 bicubic resize → weak/strong 증강 → 정규화
+- 데이터 split·라벨·원본 파일 수정 없음. 이미지 디스크 캐시 생성 없음
+
+알고리즘 설정:
+
+| 설정 | 항목 |
+| --- | --- |
+| SSR | `relabel_threshold`, `selection_threshold`, `neighbors`, `mixup_alpha`, `feature_consistency_weight` |
+| LSL | `structural_labels.enabled`, `neighbors`, `loss_weight` |
+| Label Wave | `label_wave.enabled`, `moving_average_window`, `patience`, `stop_training` |
+
+- LSL OFF여도 SSR weak/strong feature consistency는 유지
+- Label Wave `stop_training=False`: checkpoint 선택·저장만 수행
+- 기본 config는 사용자 데이터용 예시. 원 논문의 실험 조건·성능 재현 설정과 구분
+- seed `0`. 새 실행은 처음부터 학습하며 자동 resume는 미구현
+
+## 결과 저장
+
+`OUTPUT_ROOT/<설정 이름>/<실행 시각>/`
+
+- `config.json`: 실행 설정
+- `metrics.jsonl`: loss·LR·validation 지표·라벨 변경 통계
+- `label_wave.jsonl`: prediction change·선택 epoch
+- `checkpoint_results.jsonl`: 저장 모델별 최종 test 지표
+- `best_balanced_accuracy.pt`, `best_macro_f1.pt`: validation 기준 best
+- `last.pt`: 마지막 완료 epoch
+- `label_wave.pt`: Label Wave 선택 모델
+
+Test는 종료 후 평가에만 사용. Validation이 없으면 best 저장 생략.
+라벨 변경 수는 수정의 정확도를 뜻하지 않으며, noisy 평가 라벨 기준 점수는 실제 정답률과 구분.
+
+## 테스트
 
 ```bash
-cd /root/project/ssr
-nohup /opt/conda/bin/python -u -m run > train.log 2>&1 &
-tail -f train.log
+uv run python -m unittest discover -s tests -t .
 ```
 
-- 실행 진입점: `run.py` 하나
-- 터미널: 진행바 표시. `nohup`: 진행바 없이 epoch 요약·중요 경고만 출력
-- bbox 준비·입력 검증 실패 시 모델 생성 전 중단
-- `crop_bbox=False`, `multi_roi=False`: 전체 이미지 학습
-- 기본 `300 epoch`; cosine LR도 300 기준
-- 새 실행마다 처음부터 학습. 기존 실행에 자동 resume·설정 반영 없음
-
-검사만 실행:
-
-```bash
-uv run python audit.py
-```
-
-- 학습과 같은 bbox 준비·제외·좌표 검증 후 사용 이미지 decode 검사
-- 제외될 이미지는 검사하지 않음. 모델 생성·학습 없음
-
-기존 CIFAR 실험:
-
-```bash
-uv run python -m cifar.run
-uv run python -m cifar.cifar_ssr
-```
-
-- CIFAR 설정/실험표: [cifar/README.md](cifar/README.md)
-- 모델 이름: `convnextv2_tiny`, `resnet18`, `resnet34` 등 timm backbone
-- 증강: `AugmentationConfig`; 방향이 중요한 데이터는 반전·회전 조절
-- LSL: `structural_labels.enabled`
-- Label Wave 저장: `label_wave.enabled`
-- Label Wave 조기 종료: `label_wave.stop_training`
-- GPU별 batch 시작값: config 상단 주석
-
-## H100 실행 설정
-
-- 기준: H100 NVL 1장, 16 vCPU, RAM 200 GB
-- 기본 학습: BF16 AMP, channels-last, CUDA fused AdamW
-- 기본 batch: train `256`, evaluation `1024`
-- train `512`: mixup forward CUDA OOM 확인으로 축소
-- worker: 학습 loader당 `16` — 두 loader 동시 `32`; feature 추출·평가 `32`
-- 평가 중 all-sample worker `16`개 유휴 상주; 상주 worker는 최대 `48`개
-- bbox JSON worker: `16`; 학습과 순차 실행
-- prefetch: worker당 `2` batch
-- worker 수는 실행 후보값. 처리량·대기시간은 `metrics.jsonl`에서 확인
-- FP32 유지: loss 계산, feature 추출, k-NN, confidence, Label Wave·정확도 평가
-- TF32 미사용; SSR/LSL 수식·selection 규칙 유지
-- `runtime.deterministic=False`: cuDNN autotune; seed는 `0` 유지
-- AMP·배치 변경: 기존 FP32 실험과 결과 차이 가능; LR 자동 확대 없음
-- CPU/MPS: AMP·channels-last·fused AdamW 미적용
-
-선택 사항 — 배치별 속도 비교:
-
-```bash
-python -u benchmark.py
-```
-
-- 후보: 파일 상단 `BATCH_SIZES`. 실제 학습과 동시 실행 금지
-- scratch 모델·임시 target; 준비 3 step + 측정 40 step
-- 출력: step 시간, sample/s, GPU 최대 메모리, OOM
-- 전체 epoch·정확도 벤치마크 아님. config 자동 변경 없음
-- CUDA AMP 참고: [PyTorch AMP](https://docs.pytorch.org/docs/stable/amp.html)
-
-## 저장
-
-`outputs/<설정 이름>/<실행 시각>/`
-
-- 실행마다 새 폴더. 명시한 `runtime.run_id` 중복은 차단
-- `config.json`: 실제 설정과 데이터 경로
-- `data_audit.jsonl`: bbox 제외 목록·최종 클래스별 개수·사전 이미지 검사
-- bbox 제외 로그의 `index`: 원본 NPY 위치. 학습 인덱스는 남은 순서대로 0부터 재부여
-- validation/test 지표: bbox 필터링 후 실제 평가 표본 기준
-- checkpoint 최대 4개:
-
-| 선택 | 파일 |
-|---|---|
-| Best balanced accuracy | `best_balanced_accuracy.pt` |
-| Best macro F1 | `best_macro_f1.pt` |
-| Last | `last.pt` |
-| Label Wave | `label_wave.pt` |
-
-- Best: validation 지표별 독립 선택. 동점은 앞선 epoch 유지
-- Last: 마지막 완료 epoch
-- Label Wave: prediction change로만 선택. GT 지표 미사용
-- 모든 checkpoint: balanced accuracy·macro F1 함께 기록
-- checkpoint 입력 정보: crop 방식·letterbox 여백·학습 scale/offset·고정 평가 ROI 포함
-- validation 없음: Best 생략. LW 비활성·후보 없음: LW 생략
-- `metrics.jsonl`: epoch별 상세 지표
-  - validation: accuracy, balanced accuracy, macro/weighted/micro F1, precision·recall
-  - 클래스별 precision·recall·F1·support, confusion matrix
-  - CE, top-2 accuracy, MCC, kappa, confidence, entropy, Brier, ECE
-  - loss별 값·가중 합, encoder/head LR, 선택·제외·라벨 변경 수·전이
-  - 클래스별 예측·선택 분포, 제공된 train 라벨과의 일치 지표
-  - 구간 시간, 처리량, 데이터 대기시간, GPU 최대 메모리
-- train 라벨 비교: noisy label 기준 진단. clean GT 정확도 아님
-- JSON 지표: 비율 `0~1`; 콘솔: `%`. MCC/kappa: `-1~1`
-- balanced accuracy: GT가 있는 클래스 recall 평균
-- macro 지표: 설정된 전체 클래스 평균; 분모 0은 0 처리
-- 데이터 대기시간: CPU의 loader 대기 측정. GPU 유휴시간과 동일하지 않음
-- `checkpoint_results.jsonl`: 4개 파일별 선택 epoch·validation·최종 test 지표
-- 같은 epoch의 checkpoint: test forward 한 번만 수행
-- `label_wave.jsonl`: PC, 이동평균, 선택 epoch, patience
-- `stop_training=False`여도 Label Wave checkpoint 저장
-- test는 학습 종료 후 저장된 모델 평가에만 사용. checkpoint 선택에 미사용
-- 자동 resume는 미구현
+- 임시 이미지·작은 모델 사용. 실제 데이터나 pretrained 다운로드 불필요
+- SSR/LSL ON·OFF, Label Wave 선택, 지표 계산, 저장·실행 경로 검증
+- CUDA 전용 검증은 CUDA가 없는 환경에서 생략
 
 ## 참고
 
-- SSR: [BMVC 2022 논문](https://bmvc2022.mpi-inf.mpg.de/0372.pdf) / [저자 코드](https://github.com/MrChenFeng/SSR_BMVC2022)
-- LSL: [CVPR 2024 논문](https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_Learning_with_Structural_Labels_for_Learning_with_Noisy_Labels_CVPR_2024_paper.pdf), Algorithm 1/2 기준
-- Label Wave: [ICLR 2024 논문](https://proceedings.iclr.cc/paper_files/paper/2024/file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf) / [저자 코드](https://github.com/tmllab/2024_ICLR_LabelWave)
-- Multi-ROI·letterbox: 기존 `multi_roi/ConvNeXt/training/ConvNeXt_27view.py`, `roi_crops.py`에서 이식. 실행 시 외부 프로젝트 import 없음
+- SSR — [BMVC 2022 논문](https://bmvc2022.mpi-inf.mpg.de/0372.pdf) · [저자 코드](https://github.com/MrChenFeng/SSR_BMVC2022)
+- LSL — [Learning with Structural Labels, CVPR 2024](https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_Learning_with_Structural_Labels_for_Learning_with_Noisy_Labels_CVPR_2024_paper.pdf)
+- Label Wave — [ICLR 2024 논문](https://proceedings.iclr.cc/paper_files/paper/2024/file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf) · [저자 코드](https://github.com/tmllab/2024_ICLR_LabelWave)
+- SSR 원 저작권·MIT 라이선스: `LICENSE` 유지

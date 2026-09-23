@@ -26,9 +26,14 @@ htmlcov/
 !.env.example
 
 # Local datasets and experiment artifacts
+/experiment_folder/
 data/
 outputs/
 # Legacy pixel caches; no longer generated
 image_cache/
 *.log
-tests
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz

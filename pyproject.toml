@@ -1,13 +1,12 @@
 [project]
 name = "structural-labels"
 version = "0.1.0"
-description = "SSR and structural-label learning for image datasets, with isolated CIFAR experiments"
+description = "Modular SSR, structural-label learning, and Label Wave for noisy image labels"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26,<2.0",
     "pillow>=10.0",
-    "scipy>=1.14",
     "timm>=1.0.15",
     "torch>=2.5",
     "torchvision>=0.20",
